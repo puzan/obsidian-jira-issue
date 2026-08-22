@@ -47,7 +47,7 @@ jobs:
             ./main.js
             ./manifest.json
             ./styles.css
-          tag_name: ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
           # name: ${{ github.ref }}
           draft: false
           prerelease: false
