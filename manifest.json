@@ -1,6 +1,6 @@
 {
-  "id": "obsidian-jira-issue",
-  "name": "Jira Issue",
+  "id": "obsidian-jira-issue-puzan",
+  "name": "Jira Issue (puzan)",
   "version": "1.58.1",
   "minAppVersion": "0.12.0",
   "description": "This plugin allows you to track the progress of Atlassian Jira issues from your Obsidian notes.",
