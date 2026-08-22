@@ -3,6 +3,7 @@ import { toDefaultedIssue, IJiraSearchResults } from "../interfaces/issueInterfa
 import JiraClient from "../client/jiraClient"
 import ObjectsCache from "../objectsCache"
 import { renderTableColumn } from "./renderTableColumns"
+import { buildNotesByIssueKey } from "../notesIndex"
 import { SearchView } from "../searchView"
 import { SettingsData } from "../settings"
 import RC from "./renderingCommon"
@@ -57,11 +58,12 @@ function renderSearchResultsTableHeader(table: HTMLElement, searchView: SearchVi
 
 async function renderSearchResultsTableBody(table: HTMLElement, searchView: SearchView, searchResults: IJiraSearchResults): Promise<void> {
     const tbody = createEl('tbody', { parent: table })
+    const columns = searchView.columns.length > 0 ? searchView.columns : SettingsData.searchColumns
+    const notesByIssueKey = columns.some(column => column.type === ESearchColumnsTypes.NOTES) ? buildNotesByIssueKey() : {}
     for (let issue of searchResults.issues) {
         issue = toDefaultedIssue(issue)
         const row = createEl('tr', { parent: tbody })
-        const columns = searchView.columns.length > 0 ? searchView.columns : SettingsData.searchColumns
-        await renderTableColumn(columns, issue, row)
+        await renderTableColumn(columns, issue, row, notesByIssueKey)
     }
 }
 

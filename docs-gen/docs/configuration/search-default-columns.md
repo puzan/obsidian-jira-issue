@@ -16,6 +16,25 @@ This section allows to define the default columns to show with the [jira-search 
 It is not possible to add custom fields columns from this view at the moment.
 :::
 
+## Notes property
+
+This setting allows you to configure the name of the frontmatter property used to connect a note to a Jira issue in the `NOTES` column.
+
+Example:
+```
+---
+jira: ABCD-711
+---
+```
+
+The default value is `jira`.
+
+Notes whose title starts with the issue key are always connected, independently from this setting.
+
+If this field is kept empty, this feature will be disabled.
+
+[Read more...](/docs/components/jira-search)
+
 ## Default columns configuration
 
 The default columns configuration is hardcoded in the plugin code, and it is applied when the button `Reset columns` is pressed.

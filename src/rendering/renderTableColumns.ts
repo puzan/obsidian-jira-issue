@@ -36,7 +36,7 @@ function deltaToStr(delta: number): string {
     return ''
 }
 
-export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIssue, row: HTMLTableRowElement): Promise<void> => {
+export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIssue, row: HTMLTableRowElement, notesByIssueKey: Record<string, TFile[]> = {}): Promise<void> => {
     let markdownNotes: TFile[] = null
     for (const column of columns) {
         switch (column.type) {
@@ -251,7 +251,10 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                 }
                 const noteCell = createEl('td', { parent: row })
                 const noteRegex = new RegExp('^' + issue.key + '[^0-9]')
-                const connectedNotes = markdownNotes.filter(n => n.name.match(noteRegex))
+                const connectedNotes = uniqueNotes([
+                    ...(notesByIssueKey[issue.key] || []),
+                    ...markdownNotes.filter(n => n.name.match(noteRegex)),
+                ])
                 if (connectedNotes.length > 0) {
                     for (const note of connectedNotes) {
                         if (column.extra) {
@@ -305,6 +308,17 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                 break
         }
     }
+}
+
+function uniqueNotes(notes: TFile[]): TFile[] {
+    const paths = new Set<string>()
+    return notes.filter(note => {
+        if (paths.has(note.path)) {
+            return false
+        }
+        paths.add(note.path)
+        return true
+    })
 }
 
 function renderNoteFile(column: ISearchColumn, note: TFile, noteCell: HTMLTableCellElement) {

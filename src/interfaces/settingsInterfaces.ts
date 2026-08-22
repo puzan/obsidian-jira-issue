@@ -34,6 +34,7 @@ export interface IJiraIssueSettings {
     inlineIssueUrlToTag: boolean
     inlineIssuePrefix: string
     searchColumns: ISearchColumn[]
+    notesProperty: string
     logRequestsResponses: boolean
     logImagesFetch: boolean
     showColorBand: boolean

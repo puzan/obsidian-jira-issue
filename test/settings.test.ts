@@ -29,6 +29,7 @@ const StoredSettings = {
     inlineIssueUrlToTag: true,
     logImagesFetch: false,
     logRequestsResponses: true,
+    notesProperty: 'notesPropertyVal',
     searchColumns: [
         // { type: ESearchColumnsTypes.KEY, compact: true },
         // { type: ESearchColumnsTypes.CUSTOM_FIELD, compact: false, extra: 'customVal' },

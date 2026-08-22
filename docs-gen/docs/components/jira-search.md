@@ -81,7 +81,7 @@ columns: key, summary, $Epic Link, $Global Rank, $12313422, -$12313499
 It is possible to provide the ID number of the custom field or its name.
 
 ## Link to notes
-The special column `NOTES` can be used with `jira-search` tables to create a column that shows all the notes that start with the issue key.
+The special column `NOTES` can be used with `jira-search` tables to create a column that shows all the notes connected to the issue.
 
 Example:
 ````
@@ -93,14 +93,37 @@ columns: key, summary, status, notes
 
 ![Notes Column](/img/notesColumn.png)
 
-This column is useful to connect the issues with your notes about them. The note title must start with the issue key but it can also contains other letters after that.
+This column is useful to connect the issues with your notes about them. A note is considered connected to an issue when its **title** starts with the issue key, or when its **frontmatter property** references the issue key.
+
+### Link by note title
+The note title must start with the issue key but it can also contains other letters after that.
 Examples:
 ```
 AAA-123
 AAA-123 User story summary
 AAA-123 Custom string
 ```
-If no notes are found, a `➕` button will be shown in order to allow the creation of a new note directly from this table.
+
+### Link by frontmatter property
+The note can reference the issue using a frontmatter property, so that the note can be named freely.
+```
+---
+jira: AAA-123
+---
+```
+The name of the property can be changed in the plugin settings (`Search columns` ➡ `Notes property`, default: `jira`). Keep the setting empty to disable this feature.
+
+The value of the property can be a single issue key or a list of issue keys, and each value can also be a wiki link or the url of the issue:
+```
+---
+jira:
+  - AAA-123
+  - "[[BBB-1 User story summary]]"
+  - https://mycompany.atlassian.net/browse/CCC-42
+---
+```
+
+If no notes are found, a `➕` button will be shown in order to allow the creation of a new note directly from this table. The new note is named after the issue key, so it is connected by title.
 
 ### Frontmatter
 

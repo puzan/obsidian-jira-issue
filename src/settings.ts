@@ -35,6 +35,7 @@ export const DEFAULT_SETTINGS: IJiraIssueSettings = {
         { type: ESearchColumnsTypes.PRIORITY, compact: true },
         { type: ESearchColumnsTypes.STATUS, compact: false },
     ],
+    notesProperty: 'jira',
     logRequestsResponses: false,
     logImagesFetch: false,
 }
@@ -508,6 +509,19 @@ export class JiraIssueSettingTab extends PluginSettingTab {
             "Columns to display in the jira-search table visualization.",
         )
         new Setting(containerEl).setDesc(desc)
+
+        new Setting(containerEl)
+            .setName('Notes property')
+            .setDesc('Frontmatter property used to link a note to a Jira issue in the NOTES column. Example: "jira: AAA-123". '
+                + 'Notes whose filename starts with the issue key are always linked. Keep this field empty to disable this feature.')
+            .addText(text => text
+                .setPlaceholder('Example: jira')
+                .setValue(SettingsData.notesProperty)
+                .onChange(async value => {
+                    SettingsData.notesProperty = value.trim()
+                    await this.saveSettings()
+                }))
+
         this._searchColumnsDetails = containerEl.createEl('details',
             { attr: isSearchColumnsDetailsOpen ? { open: true } : {} }
         )

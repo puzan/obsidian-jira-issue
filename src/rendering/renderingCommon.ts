@@ -68,7 +68,7 @@ export default {
     },
 
     getFrontMatter(file: TFile): FrontMatterCache {
-        return ObsidianApp.metadataCache.getFileCache(file).frontmatter
+        return ObsidianApp.metadataCache.getFileCache(file)?.frontmatter
     },
 
     renderContainer(children: HTMLElement[]): HTMLElement {
