@@ -1,7 +1,7 @@
 import moment from "moment"
+import ms from "ms"
 import { IMultiSeries, ISeries } from "../interfaces/issueInterfaces"
 import API from "./api"
-const ms = require('ms')
 
 const CHART_WIDTH = '800px'
 
@@ -62,7 +62,7 @@ export async function getWorklogPerDay(projectKeyOrId: string, startDate: string
             return {
                 title: u[0],
                 data: Object.values(u[1])
-            } as IChartSeries
+            }
         }))
 }
 
@@ -83,7 +83,7 @@ export async function getWorklogPerUser(projectKeyOrId: string, startDate: strin
                 series[a] = series[a] / MS_IN_A_DAY
             }
             break
-        case EChartFormat.PERCENTAGE:
+        case EChartFormat.PERCENTAGE: {
             const days = moment.duration(moment(endDate).diff(startDate)).asDays()
             for (const author in series) {
                 if (opt.capacity) {
@@ -97,6 +97,7 @@ export async function getWorklogPerUser(projectKeyOrId: string, startDate: strin
                 }
             }
             break
+        }
         default:
             throw new Error('Invalid chart format')
     }

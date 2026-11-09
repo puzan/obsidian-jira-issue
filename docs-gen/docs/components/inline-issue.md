@@ -66,3 +66,15 @@ Example:
 Non compact mode: https://my-project.jira.com/browse/ABCD-1234
 Compact mode: -https://my-project.jira.com/browse/ABCD-1234
 ```
+
+### Overflow & Animated Scrolling
+
+To ensure inline tags fit smoothly into sentences, bullet points, and tables without breaking layouts:
+- Summaries and statuses exceeding the configured maximum width (e.g. `20rem` for summaries, `2rem` for statuses) stay on a single compact line.
+- When `Animate overflowing text` is enabled, overflowing text scrolls horizontally to reveal the complete summary or status.
+- The full summary and status are also always accessible via tooltip.
+- The animation is disabled by default. It also remains disabled when your operating system has *Reduced Motion* enabled, leaving text truncated with an ellipsis (`...`).
+
+### Account Color Bands
+
+When multiple Jira accounts are configured and `Show color band` is enabled, each inline issue tag displays a subtle vertical color stripe on its left edge matching the account's configured accent color.

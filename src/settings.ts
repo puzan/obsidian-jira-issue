@@ -1,8 +1,19 @@
-import { App, Notice, PluginSettingTab, Setting, TextComponent } from 'obsidian'
+import { App, Notice, PluginSettingTab, Setting, TextComponent, WorkspaceLeaf } from 'obsidian'
 import JiraClient from './client/jiraClient'
-import { COLOR_SCHEMA_DESCRIPTION, EAuthenticationTypes, EColorSchema, ESearchColumnsTypes, IJiraIssueAccountSettings, IJiraIssueSettings, SEARCH_COLUMNS_DESCRIPTION } from './interfaces/settingsInterfaces'
+import { COLOR_SCHEMA_DESCRIPTION, CREDENTIAL_STORAGE_TYPE_DESCRIPTION, EAuthenticationTypes, EColorSchema, ECredentialStorageType, ERenderStyle, RENDER_STYLE_DESCRIPTION, ESearchColumnsTypes, IJiraIssueAccountSettings, IJiraIssueSettings, SEARCH_COLUMNS_DESCRIPTION } from './interfaces/settingsInterfaces'
 import JiraIssuePlugin from './main'
 import { getRandomHexColor } from './utils'
+import { isSecretStorageAvailable, loadAccountSecrets, saveAccountSecrets, deleteAccountSecrets } from './secretStorage'
+import { decryptSecret, encryptSecret } from './crypto/encryption'
+import { UnlockModal } from './modals/unlockModal'
+import { refreshInlineIssuesEffect } from './rendering/inlineIssueViewPlugin'
+import { COPY_TEMPLATE_PLACEHOLDERS } from './rendering/renderTableColumns'
+
+export let MasterPassphraseSession: string | null = null
+
+export function setMasterPassphraseSession(passphrase: string | null) {
+    MasterPassphraseSession = passphrase
+}
 
 const AUTHENTICATION_TYPE_DESCRIPTION = {
     [EAuthenticationTypes.OPEN]: 'Open',
@@ -15,15 +26,22 @@ export const DEFAULT_SETTINGS: IJiraIssueSettings = {
     accounts: [],
     apiBasePath: '/rest/api/latest',
     cacheTime: '15m',
+    requestTimeout: '20s',
     searchResultsLimit: 10,
     cache: {
         columns: [],
     },
     colorSchema: EColorSchema.FOLLOW_OBSIDIAN,
+    renderStyle: ERenderStyle.MODERN,
     inlineIssueUrlToTag: true,
     inlineIssuePrefix: 'JIRA:',
+    copyColumnTemplate: '{prefix}{key}',
+    issueSummaryMaxWidthRem: 20,
+    issueStatusMaxWidthRem: 2,
+    animateOverflowingText: false,
     showColorBand: true,
     showJiraLink: true,
+    credentialStorageType: ECredentialStorageType.KEYCHAIN,
     searchColumns: [
         { type: ESearchColumnsTypes.KEY, compact: false },
         { type: ESearchColumnsTypes.SUMMARY, compact: false },
@@ -40,14 +58,21 @@ export const DEFAULT_SETTINGS: IJiraIssueSettings = {
     logImagesFetch: false,
 }
 
+function generateAccountId(): string {
+    return (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : Math.random().toString(36).substring(2, 11)
+}
+
 export const DEFAULT_ACCOUNT: IJiraIssueAccountSettings = {
+    id: '',
     alias: 'Default',
     host: 'https://mycompany.atlassian.net',
+    webBaseUrl: '',
     authenticationType: EAuthenticationTypes.OPEN,
     password: '',
     priority: 1,
     color: '#000000',
     use2025Api: false,
+    disableImageFetch: false,
     cache: {
         statusColor: {},
         customFieldsIdToName: {},
@@ -64,9 +89,25 @@ function deepCopy(obj: any): any {
     return JSON.parse(JSON.stringify(obj))
 }
 
+function normalizePositiveNumber(value: number, defaultValue: number): number {
+    const parsedValue = Number(value)
+    return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : defaultValue
+}
+
+// Strips plaintext password/bareToken from the given accounts (in place) and reports whether
+// any were actually present, so callers can warn the user that pending credentials weren't saved.
+function stripPlaintextSecrets(accounts: IJiraIssueAccountSettings[]): boolean {
+    const hadPendingSecrets = accounts.some(account => account.password || account.bareToken)
+    for (const account of accounts) {
+        delete account.password
+        delete account.bareToken
+    }
+    return hadPendingSecrets
+}
+
 export class JiraIssueSettingTab extends PluginSettingTab {
     private _plugin: JiraIssuePlugin
-    private _onChangeListener: (() => void) | null = null
+    private _onChangeListener: ((options?: { isVisualOnly?: boolean }) => void) | null = null
     private _searchColumnsDetails: HTMLDetailsElement = null
     private _showPassword = false
 
@@ -76,10 +117,26 @@ export class JiraIssueSettingTab extends PluginSettingTab {
     }
 
     async loadSettings(): Promise<void> {
+        const storedData = (await this._plugin.loadData()) || {}
         // Read plugin data and fill new fields with default values
-        Object.assign(SettingsData, DEFAULT_SETTINGS, await this._plugin.loadData())
-        for (const i in SettingsData.accounts) {
+        Object.assign(SettingsData, DEFAULT_SETTINGS, storedData)
+        SettingsData.animateOverflowingText = SettingsData.animateOverflowingText === true
+        SettingsData.issueSummaryMaxWidthRem = normalizePositiveNumber(SettingsData.issueSummaryMaxWidthRem, DEFAULT_SETTINGS.issueSummaryMaxWidthRem)
+        SettingsData.issueStatusMaxWidthRem = normalizePositiveNumber(SettingsData.issueStatusMaxWidthRem, DEFAULT_SETTINGS.issueStatusMaxWidthRem)
+
+        // Ensure default credentialStorageType if not present
+        if (!storedData.credentialStorageType) {
+            SettingsData.credentialStorageType = isSecretStorageAvailable(this.app)
+                ? ECredentialStorageType.KEYCHAIN
+                : ECredentialStorageType.PLAINTEXT
+        }
+        let generatedAccountIds = false
+        for (let i = 0; i < SettingsData.accounts.length; i++) {
             SettingsData.accounts[i] = Object.assign({}, DEFAULT_ACCOUNT, SettingsData.accounts[i])
+            if (!SettingsData.accounts[i].id) {
+                SettingsData.accounts[i].id = generateAccountId()
+                generatedAccountIds = true
+            }
         }
         SettingsData.cache = deepCopy(DEFAULT_SETTINGS.cache)
 
@@ -88,8 +145,10 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 // Legacy credentials migration
                 SettingsData.accounts = [
                     {
+                        id: generateAccountId(),
                         priority: 1,
                         host: SettingsData.host,
+                        webBaseUrl: DEFAULT_ACCOUNT.webBaseUrl,
                         authenticationType: SettingsData.authenticationType,
                         username: SettingsData.username,
                         password: SettingsData.password,
@@ -98,40 +157,178 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                         color: DEFAULT_ACCOUNT.color,
                         cache: DEFAULT_ACCOUNT.cache,
                         use2025Api: false,
+                        disableImageFetch: DEFAULT_ACCOUNT.disableImageFetch,
                     }
                 ]
             } else {
                 // First installation
-                SettingsData.accounts = [DEFAULT_ACCOUNT]
+                const defaultAcc = Object.assign({}, DEFAULT_ACCOUNT, { id: generateAccountId() })
+                SettingsData.accounts = [defaultAcc]
             }
-            this.saveSettings()
+            await this.saveSettings()
         }
+
+        // Handle Credential Storage
+        if (SettingsData.credentialStorageType === ECredentialStorageType.KEYCHAIN && isSecretStorageAvailable(this.app)) {
+            let needsSave = false
+            for (const account of SettingsData.accounts) {
+                const rawAccountData = storedData.accounts ? storedData.accounts.find((a: any) => a.alias === account.alias || a.id === account.id) : null
+                if (rawAccountData && (rawAccountData.password || rawAccountData.bareToken)) {
+                    // Migrate legacy plaintext in data.json to SecretStorage
+                    account.password = rawAccountData.password || account.password
+                    account.bareToken = rawAccountData.bareToken || account.bareToken
+                    await saveAccountSecrets(this.app, account)
+                    needsSave = true
+                }
+                const secrets = await loadAccountSecrets(this.app, account)
+                if (secrets.password !== undefined) account.password = secrets.password
+                if (secrets.bareToken !== undefined) account.bareToken = secrets.bareToken
+            }
+            if (needsSave) {
+                await this.saveSettings()
+            }
+        } else if (SettingsData.credentialStorageType === ECredentialStorageType.PASSPHRASE) {
+            const hasEncryptedSecrets = SettingsData.accounts.some(a => a.encryptedPassword || a.encryptedBareToken)
+            if (hasEncryptedSecrets) {
+                if (MasterPassphraseSession) {
+                    await this.decryptAccountsWithPassphrase(MasterPassphraseSession)
+                } else {
+                    new UnlockModal(this.app, async (passphrase) => {
+                        MasterPassphraseSession = passphrase
+                        await this.decryptAccountsWithPassphrase(passphrase)
+                    }).open()
+                }
+            }
+        }
+
         this.accountsConflictsFix()
+
+        // Saved issues refer to their account by id, so a generated id must stay the same on the
+        // next load. Saved last, once the secrets are loaded, so they are not overwritten with empty values
+        if (generatedAccountIds) {
+            await this.saveSettings()
+        }
     }
 
-    async saveSettings() {
+    private async decryptAccountsWithPassphrase(passphrase: string) {
+        for (const account of SettingsData.accounts) {
+            if (account.encryptedPassword) {
+                try {
+                    account.password = await decryptSecret(passphrase, account.encryptedPassword)
+                } catch {
+                    new Notice('Jira Issue: Failed to decrypt password. Check Master Passphrase.')
+                }
+            }
+            if (account.encryptedBareToken) {
+                try {
+                    account.bareToken = await decryptSecret(passphrase, account.encryptedBareToken)
+                } catch {
+                    new Notice('Jira Issue: Failed to decrypt token. Check Master Passphrase.')
+                }
+            }
+        }
+    }
+
+    async saveSettings(options?: { isVisualOnly?: boolean }) {
         const settingsToStore: IJiraIssueSettings = Object.assign({}, SettingsData, {
             // Global cache settings cleanup
             cache: DEFAULT_SETTINGS.cache, jqlAutocomplete: null, customFieldsIdToName: null, customFieldsNameToId: null, statusColorCache: null
         })
         // Account cache settings cleanup
+        settingsToStore.accounts = deepCopy(SettingsData.accounts)
         settingsToStore.accounts.forEach(account => account.cache = DEFAULT_ACCOUNT.cache)
+
+        if (SettingsData.credentialStorageType === ECredentialStorageType.KEYCHAIN) {
+            if (isSecretStorageAvailable(this.app)) {
+                for (const account of SettingsData.accounts) {
+                    await saveAccountSecrets(this.app, account)
+                }
+                stripPlaintextSecrets(settingsToStore.accounts)
+                for (const account of settingsToStore.accounts) {
+                    delete account.encryptedPassword
+                    delete account.encryptedBareToken
+                }
+            } else {
+                // Secret storage unavailable on this platform/version (e.g. a vault synced from
+                // a desktop session where it was available): never persist plaintext secrets to
+                // disk. They remain live in SettingsData.accounts for the rest of this session.
+                const hadPendingSecrets = stripPlaintextSecrets(settingsToStore.accounts)
+                if (hadPendingSecrets) {
+                    new Notice('Jira Issue: OS Keychain is unavailable on this platform. Credentials were not saved to disk; they will work for this session but were not persisted.')
+                }
+            }
+        } else if (SettingsData.credentialStorageType === ECredentialStorageType.PASSPHRASE) {
+            if (isSecretStorageAvailable(this.app)) {
+                for (const account of SettingsData.accounts) {
+                    await deleteAccountSecrets(this.app, account)
+                }
+            }
+            if (MasterPassphraseSession) {
+                for (const account of settingsToStore.accounts) {
+                    if (account.password) {
+                        account.encryptedPassword = await encryptSecret(MasterPassphraseSession, account.password)
+                        delete account.password
+                    }
+                    if (account.bareToken) {
+                        account.encryptedBareToken = await encryptSecret(MasterPassphraseSession, account.bareToken)
+                        delete account.bareToken
+                    }
+                }
+            } else {
+                // No unlocked Master Passphrase session: never persist plaintext secrets to disk.
+                // Strip them from the copy being saved (they remain live in SettingsData.accounts
+                // in memory for the rest of this session) and tell the user why.
+                const hadPendingSecrets = stripPlaintextSecrets(settingsToStore.accounts)
+                if (hadPendingSecrets) {
+                    new Notice('Jira Issue: Unlock your Master Passphrase to save new or changed credentials to disk. They will work for this session but were not persisted.')
+                }
+            }
+        } else if (SettingsData.credentialStorageType === ECredentialStorageType.PLAINTEXT) {
+            if (isSecretStorageAvailable(this.app)) {
+                for (const account of SettingsData.accounts) {
+                    await deleteAccountSecrets(this.app, account)
+                }
+            }
+            for (const account of settingsToStore.accounts) {
+                delete account.encryptedPassword
+                delete account.encryptedBareToken
+            }
+        }
+
         // Delete old properties
-        delete (settingsToStore as any)['darkMode']
-        delete (settingsToStore as any)['host']
-        delete (settingsToStore as any)['authenticationType']
-        delete (settingsToStore as any)['username']
-        delete (settingsToStore as any)['password']
-        delete (settingsToStore as any)['customFieldsNames']
+        const legacySettingsToStore = settingsToStore as unknown as Record<string, unknown>
+        delete legacySettingsToStore['darkMode']
+        delete legacySettingsToStore['host']
+        delete legacySettingsToStore['authenticationType']
+        delete legacySettingsToStore['username']
+        delete legacySettingsToStore['password']
+        delete legacySettingsToStore['customFieldsNames']
 
         await this._plugin.saveData(settingsToStore)
 
         if (this._onChangeListener) {
-            this._onChangeListener()
+            this._onChangeListener(options)
+        }
+        if (this.app && this.app.workspace) {
+            this.app.workspace.iterateAllLeaves((leaf: WorkspaceLeaf) => {
+                if (leaf.view) {
+                    // previewMode/editor.cm are undocumented internals not present on the public View type
+                    const view = leaf.view as any
+                    if (typeof view.previewMode?.rerender === 'function') {
+                        view.previewMode.rerender(true)
+                    }
+                    const editor = view.editor
+                    if (editor && editor.cm && typeof editor.cm.dispatch === 'function') {
+                        editor.cm.dispatch({
+                            effects: [refreshInlineIssuesEffect.of()]
+                        })
+                    }
+                }
+            })
         }
     }
 
-    onChange(listener: () => void) {
+    onChange(listener: (options?: { isVisualOnly?: boolean }) => void) {
         this._onChangeListener = listener
     }
 
@@ -152,12 +349,12 @@ export class JiraIssueSettingTab extends PluginSettingTab {
 
     displayHeader() {
         const { containerEl } = this
-        containerEl.createEl('h2', { text: 'Jira Issue' })
+        new Setting(containerEl).setName('Jira Issue').setHeading()
         const description = containerEl.createEl('p')
         description.appendText('Need help? Explore the ')
         description.appendChild(createEl('a', {
             text: 'Jira Issue documentation',
-            href: 'https://marc0l92.github.io/obsidian-jira-issue/',
+            href: 'https://obsidian-jira-plugin.github.io/obsidian-jira-issue/',
         }))
         description.appendText('.')
 
@@ -165,16 +362,16 @@ export class JiraIssueSettingTab extends PluginSettingTab {
 
     displayFooter() {
         const { containerEl } = this
-        containerEl.createEl('h3', { text: 'Support development' })
+        new Setting(containerEl).setName('Support development').setHeading()
         const description = containerEl.createEl('p')
-        description.appendText('If you enjoy JiraIssue, consider giving me your feedback on the ')
+        description.appendText('If you enjoy Jira Issue, consider giving feedback on the ')
         description.appendChild(createEl('a', {
-            text: 'github repository',
-            href: 'https://github.com/marc0l92/obsidian-jira-issue/issues',
+            text: 'GitHub repository',
+            href: 'https://github.com/Obsidian-jira-plugin/obsidian-jira-issue/issues',
         }))
         description.appendText(', and maybe ')
         description.appendChild(createEl('a', {
-            text: 'buying me a coffee',
+            text: 'buying Marc a coffee',
             href: 'https://ko-fi.com/marc0l92',
         }))
         description.appendText(' ☕.')
@@ -189,7 +386,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
 
     displayAccountsSettings() {
         const { containerEl } = this
-        containerEl.createEl('h3', { text: 'Accounts' })
+        new Setting(containerEl).setName('Accounts').setHeading()
 
         for (const account of SettingsData.accounts) {
             const accountSetting = new Setting(containerEl)
@@ -207,6 +404,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                     .setTooltip('Delete')
                     .setDisabled(SettingsData.accounts.length <= 1)
                     .onClick(async () => {
+                        await deleteAccountSecrets(this.app, account)
                         SettingsData.accounts.remove(account)
                         this.accountsConflictsFix()
                         await this.saveSettings()
@@ -232,7 +430,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
         if (!newAccount) newAccount = Object.assign({}, prevAccount)
         const { containerEl } = this
         containerEl.empty()
-        containerEl.createEl('h3', { text: 'Modify account' })
+        new Setting(containerEl).setName('Modify account').setHeading()
 
         new Setting(containerEl)
             .setName('Alias')
@@ -251,6 +449,15 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 .setValue(newAccount.host)
                 .onChange(async value => {
                     newAccount.host = value
+                }))
+        new Setting(containerEl)
+            .setName('Web Base URL')
+            .setDesc('Optional browser-facing Jira URL (use when browser links differ from the API host).')
+            .addText(text => text
+                .setPlaceholder('Example: https://your-company.atlassian.net')
+                .setValue(newAccount.webBaseUrl || '')
+                .onChange(async value => {
+                    newAccount.webBaseUrl = value
                 }))
         new Setting(containerEl)
             .setName('Authentication type')
@@ -389,6 +596,16 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 }))
 
         new Setting(containerEl)
+            .setName('Disable icon fetching')
+            .setDesc('Disable fetching of icons (e.g. issue type, priority) from this Jira server and instead use official icons from Atlassian.')
+            .addToggle(toggle => toggle
+                .setValue(newAccount.disableImageFetch ?? false)
+                .onChange(async value => {
+                    newAccount.disableImageFetch = value
+                    await this.saveSettings()
+                }))
+
+        new Setting(containerEl)
             .addButton(button => button
                 .setButtonText("Back")
                 .setWarning()
@@ -434,7 +651,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
 
     displayRenderingSettings() {
         const { containerEl } = this
-        containerEl.createEl('h3', { text: 'Rendering' })
+        new Setting(containerEl).setName('Rendering').setHeading()
 
         new Setting(containerEl)
             .setName('Default search results limit')
@@ -447,6 +664,17 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                     await this.saveSettings()
                 }))
         new Setting(containerEl)
+            .setName('Render style')
+            .setDesc('Choose between Modern (Obsidian Native with pastel status badges) or Classic (legacy Bulma tags).')
+            .addDropdown(dropdown => dropdown
+                .addOptions(RENDER_STYLE_DESCRIPTION)
+                .setValue(SettingsData.renderStyle || ERenderStyle.MODERN)
+                .onChange(async value => {
+                    SettingsData.renderStyle = value as ERenderStyle
+                    await this.saveSettings({ isVisualOnly: true })
+                }))
+
+        new Setting(containerEl)
             .setName('Color schema')
             // .setDesc('')
             .addDropdown(dropdown => dropdown
@@ -454,7 +682,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 .setValue(SettingsData.colorSchema)
                 .onChange(async value => {
                     SettingsData.colorSchema = value as EColorSchema
-                    await this.saveSettings()
+                    await this.saveSettings({ isVisualOnly: true })
                 }))
 
         new Setting(containerEl)
@@ -464,7 +692,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 .setValue(SettingsData.inlineIssueUrlToTag)
                 .onChange(async value => {
                     SettingsData.inlineIssueUrlToTag = value
-                    await this.saveSettings()
+                    await this.saveSettings({ isVisualOnly: true })
                 }))
 
         const inlineIssuePrefixDesc = (prefix: string) => 'Prefix to use when rendering inline issues. Keep this field empty to disable this feature. '
@@ -477,8 +705,60 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 .onChange(async value => {
                     SettingsData.inlineIssuePrefix = value
                     inlineIssuePrefixSetting.setDesc(inlineIssuePrefixDesc(SettingsData.inlineIssuePrefix))
-                    await this.saveSettings()
+                    await this.saveSettings({ isVisualOnly: true })
                 }))
+
+        new Setting(containerEl)
+            .setName('Copy column template')
+            .setDesc('Text copied by the COPY_TO_CLIPBOARD search column. Placeholders: '
+                + Object.keys(COPY_TEMPLATE_PLACEHOLDERS).map(p => `{${p}}`).join(', '))
+            .addTextArea(textArea => {
+                textArea
+                    .setPlaceholder(DEFAULT_SETTINGS.copyColumnTemplate)
+                    .setValue(SettingsData.copyColumnTemplate)
+                    .onChange(async value => {
+                        SettingsData.copyColumnTemplate = value || DEFAULT_SETTINGS.copyColumnTemplate
+                        await this.saveSettings({ isVisualOnly: true })
+                    })
+                textArea.inputEl.rows = 3
+            })
+
+        new Setting(containerEl)
+            .setName('Issue summary maximum width')
+            .setDesc('Maximum width of issue summaries in rem.')
+            .addText(text => {
+                text
+                    .setValue(SettingsData.issueSummaryMaxWidthRem.toString())
+                    .onChange(async value => {
+                        SettingsData.issueSummaryMaxWidthRem = normalizePositiveNumber(Number(value), DEFAULT_SETTINGS.issueSummaryMaxWidthRem)
+                        await this.saveSettings({ isVisualOnly: true })
+                    })
+                text.inputEl.setAttrs({ type: 'number', min: '0.1', step: '1' })
+            })
+
+        new Setting(containerEl)
+            .setName('Issue status maximum width')
+            .setDesc('Maximum width of issue statuses in rem.')
+            .addText(text => {
+                text
+                    .setValue(SettingsData.issueStatusMaxWidthRem.toString())
+                    .onChange(async value => {
+                        SettingsData.issueStatusMaxWidthRem = normalizePositiveNumber(Number(value), DEFAULT_SETTINGS.issueStatusMaxWidthRem)
+                        await this.saveSettings({ isVisualOnly: true })
+                    })
+                text.inputEl.setAttrs({ type: 'number', min: '0.1', step: '1' })
+            })
+
+        new Setting(containerEl)
+            .setName('Animate overflowing text')
+            .setDesc('Scroll issue summaries and statuses when they exceed their maximum width. Disabled by default and ignored when reduced motion is enabled.')
+            .addToggle(toggle => toggle
+                .setValue(SettingsData.animateOverflowingText)
+                .onChange(async value => {
+                    SettingsData.animateOverflowingText = value
+                    await this.saveSettings({ isVisualOnly: true })
+                }))
+
         new Setting(containerEl)
             .setName('Show color band')
             .setDesc('Display color band near by inline issue to simplify the account identification.')
@@ -486,7 +766,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 .setValue(SettingsData.showColorBand)
                 .onChange(async value => {
                     SettingsData.showColorBand = value
-                    await this.saveSettings()
+                    await this.saveSettings({ isVisualOnly: true })
                 }))
 
         new Setting(containerEl)
@@ -496,15 +776,15 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                 .setValue(SettingsData.showJiraLink)
                 .onChange(async value => {
                     SettingsData.showJiraLink = value
-                    await this.saveSettings()
+                    await this.saveSettings({ isVisualOnly: true })
                 }))
     }
 
     displaySearchColumnsSettings(isSearchColumnsDetailsOpen: boolean) {
         const { containerEl } = this
-        containerEl.createEl('h3', { text: 'Search columns' })
+        new Setting(containerEl).setName('Search columns').setHeading()
 
-        const desc = document.createDocumentFragment()
+        const desc = createFragment()
         desc.append(
             "Columns to display in the jira-search table visualization.",
         )
@@ -616,7 +896,39 @@ export class JiraIssueSettingTab extends PluginSettingTab {
 
     displayExtraSettings() {
         const { containerEl } = this
-        containerEl.createEl('h3', { text: 'Cache' })
+
+        new Setting(containerEl).setName('Security').setHeading()
+        const secretStorageAvailable = isSecretStorageAvailable(this.app)
+        new Setting(containerEl)
+            .setName('Credential storage method')
+            .setDesc(secretStorageAvailable
+                ? 'Choose how passwords and tokens are stored securely.'
+                : 'OS Keychain is not supported on this platform/version. Master Passphrase or Plaintext can be used.')
+            .addDropdown(dropdown => dropdown
+                .addOptions(CREDENTIAL_STORAGE_TYPE_DESCRIPTION)
+                .setValue(SettingsData.credentialStorageType)
+                .onChange(async value => {
+                    const newType = value as ECredentialStorageType
+                    if (newType === ECredentialStorageType.KEYCHAIN && !secretStorageAvailable) {
+                        new Notice('OS Keychain (SecretStorage) is not supported on this platform/version.')
+                        dropdown.setValue(SettingsData.credentialStorageType)
+                        return
+                    }
+                    if (newType === ECredentialStorageType.PASSPHRASE && !MasterPassphraseSession) {
+                        new UnlockModal(this.app, async (passphrase) => {
+                            MasterPassphraseSession = passphrase
+                            SettingsData.credentialStorageType = newType
+                            await this.saveSettings()
+                            new Notice('Credential storage set to Master Passphrase.')
+                        }).open()
+                    } else {
+                        SettingsData.credentialStorageType = newType
+                        await this.saveSettings()
+                        new Notice(`Credential storage set to ${CREDENTIAL_STORAGE_TYPE_DESCRIPTION[newType]}.`)
+                    }
+                }))
+
+        new Setting(containerEl).setName('Cache').setHeading()
 
         new Setting(containerEl)
             .setName('Cache time')
@@ -629,7 +941,18 @@ export class JiraIssueSettingTab extends PluginSettingTab {
                     await this.saveSettings()
                 }))
 
-        containerEl.createEl('h3', { text: 'Troubleshooting' })
+        new Setting(containerEl)
+            .setName('Request timeout')
+            .setDesc('Time to wait for Jira to answer. After that the request counts as failed and the last data loaded successfully is shown instead. A number without unit means seconds, it can be from 1s to about 25 days. Increase it if large searches time out.')
+            .addText(text => text
+                .setPlaceholder('Example: 20s, 1m')
+                .setValue(SettingsData.requestTimeout)
+                .onChange(async value => {
+                    SettingsData.requestTimeout = value
+                    await this.saveSettings()
+                }))
+
+        new Setting(containerEl).setName('Troubleshooting').setHeading()
         new Setting(containerEl)
             .setName('Log data request and responses')
             .setDesc('Log in the console (CTRL+Shift+I) all the API requests and responses performed by the plugin.')
@@ -652,6 +975,7 @@ export class JiraIssueSettingTab extends PluginSettingTab {
 
     createNewEmptyAccount() {
         const newAccount = JSON.parse(JSON.stringify(DEFAULT_ACCOUNT))
+        newAccount.id = generateAccountId()
         newAccount.priority = SettingsData.accounts.length + 1
         this.accountsConflictsFix()
         return newAccount

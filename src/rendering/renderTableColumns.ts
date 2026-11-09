@@ -1,10 +1,12 @@
-import { setIcon, TFile } from "obsidian"
+import { Notice, setIcon, TFile } from "obsidian"
 import { IJiraDevStatus, IJiraIssue } from "../interfaces/issueInterfaces"
 import RC, { JIRA_STATUS_COLOR_MAP, JIRA_STATUS_COLOR_MAP_BY_NAME } from "./renderingCommon"
 import * as jsonpath from 'jsonpath'
 import ObjectsCache from "../objectsCache"
 import JiraClient from "../client/jiraClient"
 import { AVATAR_RESOLUTION, ESearchColumnsTypes, ISearchColumn } from "../interfaces/settingsInterfaces"
+import { getIssue } from "../api/apiBase"
+import { SettingsData } from "../settings"
 
 const DESCRIPTION_COMPACT_MAX_LENGTH = 20
 
@@ -36,7 +38,103 @@ function deltaToStr(delta: number): string {
     return ''
 }
 
-export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIssue, row: HTMLTableRowElement, notesByIssueKey: Record<string, TFile[]> = {}): Promise<void> => {
+export const COPY_TEMPLATE_PLACEHOLDERS: Record<string, (issue: IJiraIssue) => string> = {
+    prefix: () => SettingsData.inlineIssuePrefix,
+    key: issue => issue.key,
+    summary: issue => issue.fields.summary,
+    status: issue => issue.fields.status?.name,
+    type: issue => issue.fields.issuetype?.name,
+    priority: issue => issue.fields.priority?.name,
+    assignee: issue => issue.fields.assignee?.displayName,
+    reporter: issue => issue.fields.reporter?.displayName,
+    project: issue => issue.fields.project?.key,
+    labels: issue => issue.fields.labels?.join(', '),
+    url: issue => RC.issueUrl(issue.account, issue.key),
+}
+
+// Unknown placeholders are left untouched so typos stay visible in the pasted text
+export function formatCopyTemplate(template: string, issue: IJiraIssue): string {
+    return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+        Object.prototype.hasOwnProperty.call(COPY_TEMPLATE_PLACEHOLDERS, name) ? COPY_TEMPLATE_PLACEHOLDERS[name](issue) ?? '' : match)
+}
+
+// Issue fields each column renders, keep in sync with renderTableColumn (and with
+// COPY_TEMPLATE_PLACEHOLDERS for the copy column). KEY, NOTES and DEV_STATUS only need the
+// issue key and id; people and custom fields are handled below
+const COLUMN_FIELDS: Partial<Record<ESearchColumnsTypes, string[]>> = {
+    [ESearchColumnsTypes.SUMMARY]: ['summary'],
+    [ESearchColumnsTypes.DESCRIPTION]: ['description'],
+    [ESearchColumnsTypes.TYPE]: ['issuetype'],
+    [ESearchColumnsTypes.CREATED]: ['created'],
+    [ESearchColumnsTypes.UPDATED]: ['updated'],
+    [ESearchColumnsTypes.PRIORITY]: ['priority'],
+    [ESearchColumnsTypes.STATUS]: ['status'],
+    [ESearchColumnsTypes.DUE_DATE]: ['duedate'],
+    [ESearchColumnsTypes.RESOLUTION]: ['resolution'],
+    [ESearchColumnsTypes.RESOLUTION_DATE]: ['resolutiondate'],
+    [ESearchColumnsTypes.PROJECT]: ['project'],
+    [ESearchColumnsTypes.ENVIRONMENT]: ['environment'],
+    [ESearchColumnsTypes.AGGREGATE_PROGRESS]: ['aggregateprogress'],
+    [ESearchColumnsTypes.AGGREGATE_TIME_ESTIMATED]: ['aggregatetimeestimate'],
+    [ESearchColumnsTypes.AGGREGATE_TIME_ORIGINAL_ESTIMATE]: ['aggregatetimeoriginalestimate'],
+    [ESearchColumnsTypes.AGGREGATE_TIME_SPENT]: ['aggregatetimespent'],
+    [ESearchColumnsTypes.FIX_VERSIONS]: ['fixVersions'],
+    [ESearchColumnsTypes.LABELS]: ['labels'],
+    [ESearchColumnsTypes.COMPONENTS]: ['components'],
+    [ESearchColumnsTypes.LAST_VIEWED]: ['lastViewed'],
+    [ESearchColumnsTypes.PROGRESS]: ['progress'],
+    [ESearchColumnsTypes.TIME_ESTIMATE]: ['timeestimate'],
+    [ESearchColumnsTypes.TIME_ORIGINAL_ESTIMATE]: ['timeoriginalestimate'],
+    [ESearchColumnsTypes.TIME_SPENT]: ['timespent'],
+    [ESearchColumnsTypes.COPY_TO_CLIPBOARD]: ['summary', 'status', 'issuetype', 'priority', 'project', 'labels'],
+}
+
+const PEOPLE_COLUMN_FIELDS: Partial<Record<ESearchColumnsTypes, string[]>> = {
+    [ESearchColumnsTypes.REPORTER]: ['reporter'],
+    [ESearchColumnsTypes.ASSIGNEE]: ['assignee'],
+    [ESearchColumnsTypes.COPY_TO_CLIPBOARD]: ['assignee', 'reporter'],
+}
+
+// Saved search results end up in the vault: keep only what the columns render. People keep
+// their name only (no email, account id or avatar), so compact columns show the name offline
+export function trimIssueForColumns(issue: IJiraIssue, columns: ISearchColumn[]): IJiraIssue {
+    const fields: Record<string, unknown> = {}
+    const keep = (field: string) => {
+        if (issue.fields[field] !== undefined) {
+            fields[field] = issue.fields[field]
+        }
+    }
+    const keepPersonName = (field: string) => {
+        fields[field] = issue.fields[field] && { displayName: issue.fields[field].displayName }
+    }
+    for (const column of columns) {
+        (PEOPLE_COLUMN_FIELDS[column.type] || []).forEach(keepPersonName)
+        if (column.type === ESearchColumnsTypes.CUSTOM_FIELD) {
+            const customFieldColumn = resolveCustomFieldColumn(issue, column.extra)
+            if (customFieldColumn.kind === 'EPIC') {
+                ['epic', 'parent', 'issuetype', `customfield_${getEpicLinkFieldId(issue)}`].forEach(keep)
+                // Without an Epic Link mapping (Server/DC) resolveEpic looks for an issue key in any custom field
+                for (const [field, value] of Object.entries(issue.fields)) {
+                    if (isEpicReference(field, value)) {
+                        fields[field] = typeof value === 'string' ? value : { key: value.key, summary: value.summary, name: value.name }
+                    }
+                }
+            } else if (customFieldColumn.kind === 'PARENT') {
+                keep('parent')
+            } else {
+                keep(customFieldColumn.field)
+            }
+        } else {
+            (COLUMN_FIELDS[column.type] || []).forEach(keep)
+        }
+    }
+    return { id: issue.id, key: issue.key, fields, account: null } as IJiraIssue
+}
+
+// offline: the issue comes from the saved results shown while Jira is unreachable, so columns
+// that need more data from Jira only use what is already in memory
+// notesByIssueKey: notes linked to issues by frontmatter property, used by the NOTES column
+export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIssue, row: HTMLTableRowElement, offline = false, notesByIssueKey: Record<string, TFile[]> = {}): Promise<void> => {
     let markdownNotes: TFile[] = null
     for (const column of columns) {
         switch (column.type) {
@@ -71,7 +169,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createEl('td', { text: issue.fields.description, parent: row })
                 }
                 break
-            case ESearchColumnsTypes.TYPE:
+            case ESearchColumnsTypes.TYPE: {
                 const typeCell = createEl('td', { parent: row })
                 if (issue.fields.issuetype.iconUrl) {
                     createEl('img', {
@@ -89,6 +187,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createSpan({ text: ' ' + issue.fields.issuetype.name, parent: typeCell })
                 }
                 break
+            }
             case ESearchColumnsTypes.CREATED:
                 if (column.compact) {
                     createEl('td', { text: '🕑', title: dateToStr(issue.fields.created), parent: row })
@@ -103,7 +202,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createEl('td', { text: dateToStr(issue.fields.updated), parent: row })
                 }
                 break
-            case ESearchColumnsTypes.REPORTER:
+            case ESearchColumnsTypes.REPORTER: {
                 const reporterName = issue.fields.reporter.displayName || ''
                 if (column.compact && reporterName && issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION]) {
                     createEl('img', {
@@ -116,7 +215,8 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createEl('td', { text: reporterName, parent: row })
                 }
                 break
-            case ESearchColumnsTypes.ASSIGNEE:
+            }
+            case ESearchColumnsTypes.ASSIGNEE: {
                 const assigneeName = issue.fields.assignee.displayName || ''
                 if (column.compact && assigneeName && issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION]) {
                     createEl('img', {
@@ -129,7 +229,8 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createEl('td', { text: assigneeName, parent: row })
                 }
                 break
-            case ESearchColumnsTypes.PRIORITY:
+            }
+            case ESearchColumnsTypes.PRIORITY: {
                 const priorityCell = createEl('td', { parent: row })
                 if (issue.fields.priority && issue.fields.priority.name) {
                     if (issue.fields.priority.iconUrl) {
@@ -149,9 +250,10 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     priorityCell.setText('-')
                 }
                 break
-            case ESearchColumnsTypes.STATUS:
-                const statusColor = JIRA_STATUS_COLOR_MAP_BY_NAME[issue.fields.status.name] || 
-                JIRA_STATUS_COLOR_MAP[issue.fields.status.statusCategory.colorName] || 
+            }
+            case ESearchColumnsTypes.STATUS: {
+                const statusColor = JIRA_STATUS_COLOR_MAP_BY_NAME[issue.fields.status.name] ||
+                JIRA_STATUS_COLOR_MAP[issue.fields.status.statusCategory.colorName] ||
                 'is-light'
                 if (column.compact) {
                     createSpan({ cls: `ji-tag no-wrap ${statusColor}`, text: issue.fields.status.name[0].toUpperCase(), title: issue.fields.status.name, attr: { 'data-status': issue.fields.status.name }, parent: createEl('td', { parent: row }) })
@@ -159,6 +261,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createSpan({ cls: `ji-tag no-wrap ${statusColor}`, text: issue.fields.status.name, title: issue.fields.status.description, attr: { 'data-status': issue.fields.status.name }, parent: createEl('td', { parent: row }) })
                 }
                 break
+            }
             case ESearchColumnsTypes.DUE_DATE:
                 if (column.compact) {
                     createEl('td', { text: '🕑', title: dateToStr(issue.fields.duedate), parent: row })
@@ -201,7 +304,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
             case ESearchColumnsTypes.PROJECT:
                 createEl('td', { text: issue.fields.project.key, title: issue.fields.project.name, parent: row })
                 break
-            case ESearchColumnsTypes.FIX_VERSIONS:
+            case ESearchColumnsTypes.FIX_VERSIONS: {
                 const fixVersionsCell = createEl('td', { parent: row })
                 for (let i = 0; i < issue.fields.fixVersions.length; i++) {
                     const fixVersion = issue.fields.fixVersions[i]
@@ -215,6 +318,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     }
                 }
                 break
+            }
             case ESearchColumnsTypes.COMPONENTS:
                 createEl('td', { text: issue.fields.components.flatMap(c => c.name).join(', '), parent: row })
                 break
@@ -242,10 +346,30 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
             case ESearchColumnsTypes.PROGRESS:
                 createEl('td', { text: issue.fields.progress.percent.toString() + '%', parent: row })
                 break
-            case ESearchColumnsTypes.CUSTOM_FIELD:
-                createEl('td', { text: renderCustomField(issue, column.extra), parent: row })
+            case ESearchColumnsTypes.COPY_TO_CLIPBOARD: {
+                const button = createEl('button', {
+                    cls: 'clickable-icon',
+                    attr: { 'aria-label': 'Copy ' + issue.key },
+                    parent: createEl('td', { parent: row }),
+                })
+                setIcon(button, 'copy')
+                button.onClickEvent(async () => {
+                    try {
+                        await navigator.clipboard.writeText(formatCopyTemplate(SettingsData.copyColumnTemplate, issue))
+                        setIcon(button, 'check')
+                        window.setTimeout(() => setIcon(button, 'copy'), 1000)
+                    } catch {
+                        new Notice('Failed to copy to clipboard')
+                    }
+                })
                 break
-            case ESearchColumnsTypes.NOTES:
+            }
+            case ESearchColumnsTypes.CUSTOM_FIELD: {
+                const customCell = createEl('td', { parent: row })
+                await renderCustomFieldCell(issue, column.extra, customCell, offline)
+                break
+            }
+            case ESearchColumnsTypes.NOTES: {
                 if (!markdownNotes) {
                     markdownNotes = RC.getNotes()
                 }
@@ -267,6 +391,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createEl('a', { text: '➕', title: 'Create new note', href: issue.key, cls: 'internal-link icon-link', parent: noteCell })
                 }
                 break
+            }
             case ESearchColumnsTypes.LAST_VIEWED:
                 if (column.compact) {
                     createEl('td', { text: '🕑', title: dateToStr(issue.fields.lastViewed), parent: row })
@@ -274,19 +399,19 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createEl('td', { text: dateToStr(issue.fields.lastViewed), parent: row })
                 }
                 break
-            case ESearchColumnsTypes.DEV_STATUS:
+            case ESearchColumnsTypes.DEV_STATUS: {
                 const cacheKey = 'dev-status-' + issue.id
                 let devStatus: IJiraDevStatus = null
                 const devStatusCacheItem = ObjectsCache.get(cacheKey)
                 if (devStatusCacheItem) {
                     devStatus = devStatusCacheItem.data as IJiraDevStatus
-                } else {
+                } else if (!offline) {
                     devStatus = await JiraClient.getDevStatus(issue.id, { account: issue.account })
                     ObjectsCache.add(cacheKey, devStatus)
                 }
                 const cell = createEl('td', { parent: row })
-                const prDetails = devStatus.summary.pullrequest.overall.details
-                if (prDetails.openCount + prDetails.mergedCount + prDetails.declinedCount > 0) {
+                const prDetails = devStatus?.summary.pullrequest.overall.details
+                if (prDetails && prDetails.openCount + prDetails.mergedCount + prDetails.declinedCount > 0) {
                     if (prDetails.openCount > 0) {
                         const prOpen = createSpan({ parent: cell, cls: `pull-request-tag pull-request-open ${RC.getTheme()}`, title: 'Open pull-request' })
                         setIcon(prOpen, 'jira-issue-git-pull-request')
@@ -306,6 +431,7 @@ export const renderTableColumn = async (columns: ISearchColumn[], issue: IJiraIs
                     createSpan({ parent: cell, title: 'No data available', text: '-' })
                 }
                 break
+            }
         }
     }
 }
@@ -342,13 +468,240 @@ function renderNoteFrontMatter(column: ISearchColumn, note: TFile, noteCell: HTM
     }
 }
 
-function renderCustomField(issue: IJiraIssue, customField: string): string {
-    if (!Number(customField)) {
-        customField = issue.account.cache.customFieldsNameToId[customField]
+const JIRA_EPIC_COLORS = [
+    '#6554c0', // Purple
+    '#0052cc', // Blue
+    '#00875a', // Green
+    '#ff5630', // Orange
+    '#00b8d9', // Cyan
+    '#ffab00', // Yellow
+    '#e91e63', // Pink
+    '#36b37e', // Teal
+]
+
+function getEpicColor(key: string): string {
+    let hash = 0
+    for (let i = 0; i < key.length; i++) {
+        hash = key.charCodeAt(i) + ((hash << 5) - hash)
     }
-    const value = issue.fields[`customfield_${customField}`]
+    const index = Math.abs(hash) % JIRA_EPIC_COLORS.length
+    return JIRA_EPIC_COLORS[index]
+}
+
+// Offline the lookup fails right away, so the callers fall back to what the issue already has
+async function lookupIssue(issueKey: string, issue: IJiraIssue, offline: boolean): Promise<IJiraIssue> {
+    if (offline) {
+        throw new Error('Jira lookups are skipped while showing saved results')
+    }
+    return getIssue(issueKey, { fields: ['*all'], account: issue.account })
+}
+
+function getEpicLinkFieldId(issue: IJiraIssue): string {
+    return issue.account?.cache?.customFieldsNameToId?.['EPIC LINK'] || issue.account?.cache?.customFieldsNameToId?.['Epic Link']
+}
+
+const ISSUE_KEY_VALUE_REGEX = /^[A-Za-z0-9_]+-\d+$/
+
+// The last fallback of resolveEpic: a custom field holding an issue key, or an object with one
+function isEpicReference(field: string, value: unknown): boolean {
+    if (!field.startsWith('customfield_') || !value) {
+        return false
+    }
+    if (typeof value === 'string') {
+        return ISSUE_KEY_VALUE_REGEX.test(value.trim())
+    }
+    const key = typeof value === 'object' ? (value as { key?: unknown }).key : null
+    return typeof key === 'string' && ISSUE_KEY_VALUE_REGEX.test(key)
+}
+
+async function resolveEpic(issue: IJiraIssue, depth = 0, offline = false): Promise<{ key?: string; summary?: string; isParentFallback?: boolean } | null> {
+    if (!issue || !issue.fields || depth > 3) {
+        return null
+    }
+
+    // 1. Check legacy Jira Server/Data Center customfield by ID if mapped
+    const customEpicFieldId = getEpicLinkFieldId(issue)
+    if (customEpicFieldId && customEpicFieldId !== 'VIRTUAL_EPIC_NAME' && issue.fields[`customfield_${customEpicFieldId}`]) {
+        const epicVal = issue.fields[`customfield_${customEpicFieldId}`]
+        if (typeof epicVal === 'string') {
+            try {
+                const epicIssue = await lookupIssue(epicVal, issue, offline)
+                return { key: epicVal, summary: epicIssue?.fields?.summary || epicVal }
+            } catch {
+                return { key: epicVal }
+            }
+        }
+    }
+
+    // 2. Check Jira Cloud Next-Gen / Team-managed issue.fields.epic
+    if (issue.fields.epic && (issue.fields.epic.key || issue.fields.epic.name || issue.fields.epic.summary)) {
+        return {
+            key: issue.fields.epic.key || issue.fields.epic.id,
+            summary: issue.fields.epic.summary || issue.fields.epic.name
+        }
+    }
+
+    // 3. Check Jira Cloud parent hierarchy (Company-managed projects)
+    if (issue.fields.parent && issue.fields.parent.key) {
+        const parent = issue.fields.parent
+
+        const isSubtask = issue.fields.issuetype?.subtask === true || 
+                          (issue.fields.issuetype?.name && issue.fields.issuetype.name.toLowerCase().includes('sub'))
+
+        if (isSubtask) {
+            // Sub-task: check if parent already has nested grandparent (the Epic)
+            if (parent.fields?.parent?.key) {
+                const grandParent = parent.fields.parent
+                return { key: grandParent.key, summary: grandParent.fields?.summary }
+            }
+            // Fetch parent Story/Task details (cached in ObjectsCache) and recursively resolve its Epic
+            try {
+                const parentStory = await lookupIssue(parent.key, issue, offline)
+                if (parentStory) {
+                    const parentEpic = await resolveEpic(parentStory, depth + 1, offline)
+                    if (parentEpic && !parentEpic.isParentFallback) {
+                        return parentEpic
+                    }
+                }
+            } catch {
+                // Ignore fetch error
+            }
+            // Fallback for Sub-task: return parent Story/Task if no Epic was found
+            return { key: parent.key, summary: parent.fields?.summary, isParentFallback: true }
+        } else {
+            // Story / Task / Bug: parent IS the Epic!
+            return { key: parent.key, summary: parent.fields?.summary }
+        }
+    }
+
+    // 4. Scan all customfields for any Epic key or Epic object (Fallback for unmapped Jira Server / Data Center)
+    for (const [key, val] of Object.entries(issue.fields)) {
+        if (!isEpicReference(key, val)) continue
+
+        if (typeof val === 'string') {
+            const epicKey = val.trim()
+            try {
+                const fetchedEpic = await lookupIssue(epicKey, issue, offline)
+                if (fetchedEpic && fetchedEpic.fields) {
+                    return { key: epicKey, summary: fetchedEpic.fields.summary || epicKey }
+                }
+            } catch {
+                return { key: epicKey }
+            }
+        } else {
+            const obj = val as any
+            return { key: obj.key, summary: obj.summary || obj.name || obj.key }
+        }
+    }
+
+    return null
+}
+
+export const VIRTUAL_EPIC_ALIASES = ['EPIC', 'EPIC LINK', 'EPIC NAME', 'EPIC_LINK', 'EPIC_NAME']
+export const VIRTUAL_PARENT_ALIASES = ['PARENT', 'PARENT LINK', 'PARENT NAME', 'PARENT_LINK', 'PARENT_NAME']
+export const VIRTUAL_CUSTOM_FIELD_ALIASES = [...VIRTUAL_EPIC_ALIASES, ...VIRTUAL_PARENT_ALIASES]
+
+type CustomFieldColumn = { kind: 'EPIC' } | { kind: 'PARENT' } | { kind: 'FIELD', field: string }
+
+function resolveCustomFieldColumn(issue: IJiraIssue, customField: string): CustomFieldColumn {
+    let fieldId = customField
+    if (!Number(customField) && issue.account?.cache?.customFieldsNameToId) {
+        fieldId = issue.account.cache.customFieldsNameToId[customField] || customField
+    }
+    const fieldUpper = customField.toUpperCase()
+    if (fieldId === 'VIRTUAL_EPIC_NAME' || VIRTUAL_EPIC_ALIASES.includes(fieldUpper)) {
+        return { kind: 'EPIC' }
+    }
+    if (fieldId === 'VIRTUAL_PARENT' || VIRTUAL_PARENT_ALIASES.includes(fieldUpper)) {
+        return { kind: 'PARENT' }
+    }
+    return { kind: 'FIELD', field: `customfield_${fieldId}` }
+}
+
+// Columns of custom fields given by name (not by id, and not Epic or Parent) need the custom
+// field names loaded from Jira to find their field
+export function hasCustomFieldColumnsByName(columns: ISearchColumn[]): boolean {
+    return columns.some(column => column.type === ESearchColumnsTypes.CUSTOM_FIELD
+        && !!column.extra
+        && !Number(column.extra)
+        && !VIRTUAL_CUSTOM_FIELD_ALIASES.includes(column.extra.toUpperCase()))
+}
+
+async function renderCustomFieldCell(issue: IJiraIssue, customField: string, cell: HTMLTableCellElement, offline: boolean): Promise<void> {
+    const customFieldColumn = resolveCustomFieldColumn(issue, customField)
+
+    // 1. Epic Link / Epic Name virtual column
+    if (customFieldColumn.kind === 'EPIC') {
+        const epic = await resolveEpic(issue, 0, offline)
+        if (epic && (epic.key || epic.summary)) {
+            const epicKey = epic.key
+            const epicSummary = epic.summary
+            const displayText = epicKey ? (epicSummary ? `${epicKey}: ${epicSummary}` : epicKey) : (epicSummary || '')
+            let epicTitle = epicKey || ''
+            if (epicSummary) {
+                epicTitle += epicTitle ? ': ' + epicSummary : epicSummary
+            }
+
+            const badgeColor = epic.isParentFallback ? '#4c9aff' : getEpicColor(epicKey || 'EPIC')
+            const linkStyle = `background-color: ${badgeColor}; color: #ffffff !important; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; font-weight: 600; text-decoration: none; display: inline-block; white-space: normal; word-break: break-word;`
+
+            if (epicKey && issue.account) {
+                createEl('a', {
+                    href: RC.issueUrl(issue.account, epicKey),
+                    text: displayText,
+                    title: epicTitle,
+                    attr: { style: linkStyle },
+                    parent: cell
+                })
+                return
+            } else if (displayText) {
+                createEl('span', {
+                    text: displayText,
+                    title: epicTitle,
+                    attr: { style: linkStyle },
+                    parent: cell
+                })
+                return
+            }
+        }
+        cell.setText('')
+        return
+    }
+
+    // 2. Parent / Parent Link virtual column (immediate parent task/story)
+    if (customFieldColumn.kind === 'PARENT') {
+        if (issue.fields?.parent) {
+            const parentKey = issue.fields.parent.key
+            const parentSummary = issue.fields.parent.fields?.summary
+            const displayText = parentKey ? (parentSummary ? `${parentKey}: ${parentSummary}` : parentKey) : (parentSummary || '')
+            let parentTitle = parentKey || ''
+            if (parentSummary) {
+                parentTitle += ': ' + parentSummary
+            }
+            if (parentKey && issue.account) {
+                createEl('a', {
+                    href: RC.issueUrl(issue.account, parentKey),
+                    text: displayText,
+                    title: parentTitle,
+                    parent: cell
+                })
+                return
+            } else {
+                cell.setText(displayText)
+                return
+            }
+        }
+        cell.setText('')
+        return
+    }
+    const value = issue.fields[customFieldColumn.field]
+    if (value === undefined || value === null) {
+        cell.setText('')
+        return
+    }
     if (typeof value === 'string' || typeof value === 'number') {
-        return value.toString()
+        cell.setText(value.toString())
+        return
     }
-    return JSON.stringify(value)
+    cell.setText(JSON.stringify(value))
 }

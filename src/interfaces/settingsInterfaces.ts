@@ -1,11 +1,31 @@
 import { IJiraAutocompleteDataField, IJiraFieldSchema } from "./issueInterfaces"
 
+export enum ECredentialStorageType {
+    KEYCHAIN = 'KEYCHAIN',
+    PASSPHRASE = 'PASSPHRASE',
+    PLAINTEXT = 'PLAINTEXT',
+}
+export const CREDENTIAL_STORAGE_TYPE_DESCRIPTION = {
+    [ECredentialStorageType.KEYCHAIN]: 'OS Keychain (SecretStorage)',
+    [ECredentialStorageType.PASSPHRASE]: 'Master Passphrase (AES-256-GCM)',
+    [ECredentialStorageType.PLAINTEXT]: 'Plaintext (data.json)',
+}
+
 export enum EAuthenticationTypes {
     OPEN = 'OPEN',
     BASIC = 'BASIC',
     CLOUD = 'CLOUD',
     BEARER_TOKEN = 'BEARER_TOKEN',
 }
+export enum ERenderStyle {
+    MODERN = 'MODERN',
+    CLASSIC = 'CLASSIC',
+}
+export const RENDER_STYLE_DESCRIPTION = {
+    [ERenderStyle.MODERN]: 'Modern (Obsidian Native & Pastell Badges)',
+    [ERenderStyle.CLASSIC]: 'Classic (Legacy Bulma Badges)',
+}
+
 export enum EColorSchema {
     FOLLOW_OBSIDIAN = 'FOLLOW_OBSIDIAN',
     LIGHT = 'LIGHT',
@@ -26,6 +46,7 @@ export interface IJiraIssueSettings {
     accounts: IJiraIssueAccountSettings[]
     apiBasePath: string
     cacheTime: string
+    requestTimeout: string
     searchResultsLimit: number
     cache: {
         columns: string[]
@@ -33,12 +54,18 @@ export interface IJiraIssueSettings {
     colorSchema: EColorSchema
     inlineIssueUrlToTag: boolean
     inlineIssuePrefix: string
+    copyColumnTemplate: string
+    issueSummaryMaxWidthRem: number
+    issueStatusMaxWidthRem: number
+    animateOverflowingText: boolean
     searchColumns: ISearchColumn[]
     notesProperty: string
     logRequestsResponses: boolean
     logImagesFetch: boolean
     showColorBand: boolean
     showJiraLink: boolean
+    credentialStorageType: ECredentialStorageType
+    renderStyle: ERenderStyle
 
     // Legacy credentials
     host?: string
@@ -49,15 +76,20 @@ export interface IJiraIssueSettings {
 }
 
 export interface IJiraIssueAccountSettings {
+    id?: string
     alias: string
     host: string
+    webBaseUrl?: string
     authenticationType: EAuthenticationTypes
     username?: string
     password?: string
     bareToken?: string
+    encryptedPassword?: string
+    encryptedBareToken?: string
     priority: number
     color: string
     use2025Api: boolean
+    disableImageFetch?: boolean
     cache: {
         statusColor: Record<string, string>
         customFieldsIdToName: Record<string, string>
@@ -115,6 +147,7 @@ export enum ESearchColumnsTypes {
 
     CUSTOM_FIELD = 'CUSTOM_FIELD',
     NOTES = 'NOTES',
+    COPY_TO_CLIPBOARD = 'COPY_TO_CLIPBOARD',
 }
 export const SEARCH_COLUMNS_DESCRIPTION = {
     [ESearchColumnsTypes.KEY]: 'Key',
@@ -150,6 +183,7 @@ export const SEARCH_COLUMNS_DESCRIPTION = {
 
     [ESearchColumnsTypes.CUSTOM_FIELD]: 'Custom field',
     [ESearchColumnsTypes.NOTES]: 'Notes',
+    [ESearchColumnsTypes.COPY_TO_CLIPBOARD]: 'Copy',
 }
 
 export interface ISearchColumn {
