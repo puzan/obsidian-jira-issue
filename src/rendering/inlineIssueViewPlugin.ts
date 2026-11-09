@@ -1,24 +1,30 @@
-import { RangeSet, StateField } from "@codemirror/state"
+import { RangeSet, StateEffect } from "@codemirror/state"
 import { Decoration, DecorationSet, EditorView, MatchDecorator, PluginSpec, PluginValue, ViewPlugin, ViewUpdate, WidgetType } from "@codemirror/view"
 import { editorLivePreviewField } from "obsidian"
 import JiraClient from "../client/jiraClient"
 import { IJiraIssue } from "../interfaces/issueInterfaces"
+import LastGoodCache from "../lastGoodCache"
 import ObjectsCache from "../objectsCache"
 import { SettingsData } from "../settings"
 import RC from "./renderingCommon"
-import escapeStringRegexp from 'escape-string-regexp'
-import { getAccountByHost } from "../utils"
-import { COMPACT_SYMBOL, JIRA_KEY_REGEX } from "../interfaces/settingsInterfaces"
+import { getAccountByHost, getIssueCacheKey } from "../utils"
+import { COMPACT_SYMBOL, ERenderStyle, JIRA_KEY_REGEX } from "../interfaces/settingsInterfaces"
 
-interface IMatchDecoratorRef {
+export const refreshInlineIssuesEffect = StateEffect.define<void>()
+
+function getRenderStyleClass(): string {
+    return SettingsData.renderStyle === ERenderStyle.CLASSIC ? 'ji-style-classic' : 'ji-style-modern'
+}
+
+export interface IMatchDecoratorRef {
     ref: MatchDecorator
 }
 
 function escapeRegexp(str: string): string {
-    return escapeStringRegexp(str).replace(/\//g, '\\/')
+    return str.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/\//g, '\\/')
 }
 
-const isEditorInLivePreviewMode = (view: EditorView) => view.state.field(editorLivePreviewField as unknown as StateField<boolean>)
+const isEditorInLivePreviewMode = (view: EditorView) => view.state.field(editorLivePreviewField)
 const isCursorInsideTag = (view: EditorView, start: number, length: number) => {
     const cursor = view.state.selection.main.head
     return (cursor > start - 1 && cursor < start + length + 1)
@@ -33,32 +39,35 @@ class InlineIssueWidget extends WidgetType {
     private _issueKey: string
     private _compact: boolean
     private _host: string
+    private _cacheKey: string
     private _htmlContainer: HTMLElement
     constructor(key: string, compact: boolean, host: string = null) {
         super()
         this._issueKey = key
         this._compact = compact
         this._host = host
-        this._htmlContainer = createSpan({ cls: 'ji-inline-issue jira-issue-container' })
+        this._cacheKey = getIssueCacheKey(key, host)
+        this._htmlContainer = createSpan({ cls: `ji-inline-issue jira-issue-container ${getRenderStyleClass()}` })
         this.buildTag()
     }
 
     buildTag() {
-        const cachedIssue = ObjectsCache.get(this._issueKey)
+        const cachedIssue = ObjectsCache.get(this._cacheKey)
         if (cachedIssue) {
             if (cachedIssue.isError) {
-                this._htmlContainer.replaceChildren(RC.renderIssueError(this._issueKey, cachedIssue.data as string))
+                this._htmlContainer.replaceChildren(RC.renderIssueFailure(this._issueKey, cachedIssue.data, this._compact, this._cacheKey))
             } else {
-                this._htmlContainer.replaceChildren(RC.renderIssue(cachedIssue.data as IJiraIssue, this._compact))
+                this._htmlContainer.replaceChildren(RC.renderIssueOrError(this._issueKey, cachedIssue.data as IJiraIssue, this._compact))
             }
         } else {
             this._htmlContainer.replaceChildren(RC.renderLoadingItem(this._issueKey))
+            const generation = LastGoodCache.generation()
             JiraClient.getIssue(this._issueKey, { account: getAccountByHost(this._host) }).then(newIssue => {
-                const issue = ObjectsCache.add(this._issueKey, newIssue).data as IJiraIssue
-                this._htmlContainer.replaceChildren(RC.renderIssue(issue, this._compact))
-            }).catch(err => {
-                ObjectsCache.add(this._issueKey, err, true)
-                this._htmlContainer.replaceChildren(RC.renderIssueError(this._issueKey, err))
+                const issue = ObjectsCache.add(this._cacheKey, newIssue).data as IJiraIssue
+                this._htmlContainer.replaceChildren(RC.renderIssueOrError(this._issueKey, issue, this._compact, () => LastGoodCache.rememberIssue(this._cacheKey, issue, generation)))
+            }, err => {
+                ObjectsCache.add(this._cacheKey, err, true)
+                this._htmlContainer.replaceChildren(RC.renderIssueFailure(this._issueKey, err, this._compact, this._cacheKey))
             })
         }
     }
@@ -66,11 +75,20 @@ class InlineIssueWidget extends WidgetType {
     toDOM(view: EditorView): HTMLElement {
         return this._htmlContainer
     }
+
+    eq(other: InlineIssueWidget): boolean {
+        // WidgetType's default eq() always returns false, meaning every match is torn down and
+        // redrawn on every decoration recompute. Since createDeco()/updateDeco() build a fresh
+        // widget instance per match, without this override even an unchanged, already-rendered
+        // tag would flicker and rebuild its DOM (and re-run the cache lookup in buildTag()) on
+        // every recompute - which now also happens on scroll, not just doc/selection changes.
+        return other._issueKey === this._issueKey && other._compact === this._compact && other._host === this._host
+    }
 }
 
 // Global variable with the last instance of the MatchDecorator rebuilt every time the settings are changed
-let jiraTagMatchDecorator: IMatchDecoratorRef = { ref: null }
-let jiraUrlMatchDecorator: IMatchDecoratorRef = { ref: null }
+const jiraTagMatchDecorator: IMatchDecoratorRef = { ref: null }
+const jiraUrlMatchDecorator: IMatchDecoratorRef = { ref: null }
 
 function buildMatchDecorators() {
     if (SettingsData.inlineIssuePrefix !== '') {
@@ -123,7 +141,7 @@ function buildMatchDecorators() {
     }
 }
 
-function buildViewPluginClass(matchDecorator: IMatchDecoratorRef) {
+export function buildViewPluginClass(matchDecorator: IMatchDecoratorRef) {
     class ViewPluginClass implements PluginValue {
         decorators: DecorationSet
 
@@ -132,9 +150,33 @@ function buildViewPluginClass(matchDecorator: IMatchDecoratorRef) {
         }
 
         update(update: ViewUpdate): void {
-            const editorModeChanged = update.startState.field(editorLivePreviewField as unknown as StateField<boolean>) !== update.state.field(editorLivePreviewField as unknown as StateField<boolean>)
-            if (update.docChanged || update.startState.selection.main !== update.state.selection.main || editorModeChanged) {
-                this.decorators = matchDecorator.ref ? matchDecorator.ref.createDeco(update.view) : RangeSet.empty
+            if (!matchDecorator.ref) {
+                this.decorators = RangeSet.empty
+                return
+            }
+
+            const editorModeChanged = update.startState.field(editorLivePreviewField) !== update.state.field(editorLivePreviewField)
+            const hasRefreshEffect = update.transactions.some(tr => tr.effects.some(e => e.is(refreshInlineIssuesEffect)))
+            const selectionChanged = update.startState.selection.main !== update.state.selection.main
+
+            if (editorModeChanged || hasRefreshEffect || selectionChanged) {
+                // A mode switch can change every match's decoration type (mark vs. widget); a
+                // refresh effect (dispatched after a settings change) means matchDecorator.ref
+                // may now be a brand new MatchDecorator instance - updateDeco() requires its
+                // `deco` argument to have come from *this exact* MatchDecorator, so it's not safe
+                // to hand off to it. A selection change can also flip a match's decoration type,
+                // since isCursorInsideTag()/isSelectionContainsTag() key off the cursor position -
+                // something updateDeco()'s own dirty-tracking (doc/viewport changes only) has no
+                // way to know affects the output. All three need a full recompute.
+                this.decorators = matchDecorator.ref.createDeco(update.view)
+            } else if (update.docChanged || update.viewportChanged) {
+                // updateDeco() only computes decorations for the current viewport too, so a
+                // viewport change (e.g. scrolling to reveal previously off-screen lines) needs to
+                // trigger a recompute - without it, tags that scroll into view stay as unrendered
+                // plain text. Unlike createDeco(), updateDeco() does its own cheap bounded
+                // re-matching (or no-ops entirely) instead of always rescanning the whole
+                // viewport, so this is far cheaper to call on every scroll tick.
+                this.decorators = matchDecorator.ref.updateDeco(update, this.decorators)
             }
         }
 

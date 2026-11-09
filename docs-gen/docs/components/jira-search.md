@@ -66,9 +66,9 @@ columns: key, -key, type, -type, reporter, -reporter, created, -created
 ````
 ![Compact Columns](/img/compactColumns.png)
 
-## Custom fields
+## Custom fields & Epic / Parent Aliases
 
-Jira non standard fields (a.k.a. custom fields) can be inserted using the `$` symbol.
+Jira non-standard fields (a.k.a. custom fields) can be inserted using the `$` symbol, specifying either the custom field name or ID number.
 
 Example:
 ````
@@ -78,7 +78,18 @@ columns: key, summary, $Epic Link, $Global Rank, $12313422, -$12313499
 ```
 ````
 
-It is possible to provide the ID number of the custom field or its name.
+### Built-in Epic & Parent Aliases
+
+To provide universal compatibility across both Jira Cloud and Jira Server / Data Center, the plugin features smart alias resolution for Epic and Parent relationships:
+
+| Alias | Description | Resolution Strategy |
+| :- | :- | :- |
+| `$Epic Link` or `$Epic Name` | Displays the Epic the issue belongs to as a colorized clickable pill | Automatically queries the Jira Cloud `parent` (if type is Epic) or Jira Server custom fields (`customfield_XXXXX`). |
+| `$Parent` or `$Parent Link` | Displays the parent issue (for subtasks or hierarchy levels) | Resolves the Jira `parent` field and falls back to Epic links. |
+
+- If compact mode (`-$Epic Link`) is used, only the Epic key is rendered in a pill badge.
+- When an Epic defines a color in Jira, the pill dynamically adopts that color.
+- If the issue is a subtask whose direct parent is inside an Epic, the plugin recursively resolves the parent hierarchy.
 
 ## Link to notes
 The special column `NOTES` can be used with `jira-search` tables to create a column that shows all the notes connected to the issue.
@@ -133,6 +144,22 @@ You can also access the frontmatter section of the linked notes using the [jsonp
 query: status = 'In Progress' order by priority DESC
 columns: key, notes, notes.title, notes.status, notes.tags, notes.tags[0], notes..book[?(@.price<30 && @.category=="fiction")]
 ```
+
+## Copy to clipboard
+The special column `COPY_TO_CLIPBOARD` adds a copy button to each row. By default it copies the issue as an [inline issue](inline-issue) (for example `JIRA:AAA-123`), ready to paste into any note.
+
+````
+```jira-search
+query: status = 'In Progress' order by priority DESC
+columns: copy_to_clipboard, key, summary, status
+```
+````
+
+The copied text can be changed in the settings with the `Copy column template` option. Available placeholders: `{prefix}` (the inline issue prefix), `{key}`, `{summary}`, `{status}`, `{type}`, `{priority}`, `{assignee}`, `{reporter}`, `{project}`, `{labels}`, `{url}`.
+
+Example: `- {prefix}{key} {summary}` copies `- JIRA:AAA-123 User story summary`.
+
+The template can span multiple lines, the line breaks are copied as well.
 
 ## Footer
 

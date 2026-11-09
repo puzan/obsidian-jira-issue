@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An Obsidian plugin (`obsidian-jira-issue`) that renders Atlassian Jira issues, searches, and counts inside Obsidian notes via code fences (` ```jira-issue `, ` ```jira-search `, ` ```jira-count `) and inline tags (`JIRA:KEY-123`).
 
+## Fork and upstream
+
+This repository is a fork with its own plugin id (`obsidian-jira-issue-puzan`) and an independent release numbering. Upstream is now https://github.com/Obsidian-jira-plugin/obsidian-jira-issue (originally `marc0l92/obsidian-jira-issue`). To sync, add it as the `upstream` remote and **merge** `upstream/master` (don't rebase). When resolving conflicts keep the fork's `id`/`name`/`version` in `manifest.json`, the fork's `version` in `package.json`, only the fork's own entries in `versions.json`, and the fork's CI setup (pnpm 11, Node `lts/*`, no docs workflow). Never push upstream tags to `origin`: version numbers overlap.
+
+Fork-only features: the NOTES search column can also list notes linked to an issue through a frontmatter property (`src/notesIndex.ts`, passed into `renderTableColumn` as `notesByIssueKey`).
+
 ## Commands
 
 Package manager is **pnpm** (see `pnpm-workspace.yaml`); CI uses `pnpm install --frozen-lockfile`.
@@ -26,7 +32,7 @@ The `docs-gen/` directory is a separate Docusaurus site (its own `package.json`/
 ## Testing notes
 
 - Jest uses `ts-jest`, `testEnvironment: node`, and resolves modules from `node_modules`, `src`, and `test` — so test files import with bare paths off those roots.
-- Obsidian's API is mocked in `__mocks__/obsidian.ts` (currently: `addIcon`, `PluginSettingTab`, `requestUrl`). Extend this mock when new Obsidian APIs are exercised by tested code.
+- Obsidian's API is mocked in `__mocks__/obsidian.ts` (currently: `addIcon`, `setIcon`, `requestUrl`, and empty stubs for `PluginSettingTab`, `EditorSuggest`, `Modal`, `Notice`, `Plugin`, `Setting`). Extend this mock when new Obsidian APIs are exercised by tested code.
 - `SettingsData` is a module-level singleton (see below); tests that touch code depending on it typically do `jest.mock('../src/settings', () => ({ SettingsData: { ... } }))` before importing the module under test, then mutate `SettingsData` directly (see `test/utils.test.ts`).
 - Shared fixtures live in `test/testData.ts`.
 
@@ -39,6 +45,11 @@ The plugin avoids passing state through constructors; instead several modules ex
 - `SettingsData` (`src/settings.ts`) — the live plugin settings object (accounts, cache TTL, columns, etc.). Loaded/saved by `JiraIssueSettingTab`, read directly by API/client/rendering code.
 - `ObsidianApp` (`src/main.ts`) — the Obsidian `App` instance, set once in `onload()` and imported elsewhere instead of being threaded through function signatures.
 - `ObjectsCache` (`src/objectsCache.ts`) — an in-memory TTL cache (TTL driven by `SettingsData.cacheTime`, parsed with `ms`). Keys are freeform strings; `api/apiBase.ts`'s `cacheWrapper` builds keys as `` `api-${func.name}-${JSON.stringify(args)}` ``.
+- `LastGoodCache` (`src/lastGoodCache.ts`) — persists the last successful issue/search/count results (trimmed to what the view renders) to `issues-cache.json` in the plugin directory, so fences can show stale results with a marker when Jira is unreachable. Renderers pass an `offline` flag down so they don't fetch more data while showing saved results.
+
+### Secrets
+
+Account passwords and tokens are stored in Obsidian's SecretStorage when available (`src/secretStorage.ts`, keys `jira-issue-<account>-<type>`), otherwise they can be encrypted with a passphrase (`src/crypto/encryption.ts`, unlocked via `src/modals/unlockModal.ts`).
 
 ### Layered API (`src/api/`)
 

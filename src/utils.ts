@@ -1,6 +1,6 @@
+import colorsys from "colorsys"
 import { IJiraIssueAccountSettings } from "./interfaces/settingsInterfaces"
 import { SettingsData } from "./settings"
-const colorsys = require('colorsys')
 
 export function getAccountByAlias(alias: string): IJiraIssueAccountSettings {
     if (alias) {
@@ -20,6 +20,11 @@ export function getAccountByHost(host: string): IJiraIssueAccountSettings {
     } else {
         return null
     }
+}
+
+// Issues written as a Jira URL are tied to that host, the others can come from any account
+export function getIssueCacheKey(issueKey: string, host: string = null): string {
+    return host ? `${host}/browse/${issueKey}` : issueKey
 }
 
 function randomBetween(min: number, max: number) {

@@ -33,10 +33,12 @@ https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-sear
 
 ## Publish new release
 
-- Make sure test are running: `npm run test`
-- Define the new version to use x.y.z
-- Run: `npm run version x.y.z`
-- Commit and push the file modified
-- Tag the commit: `git tag x.y.z`
-- Push the tag: `git push --tags`
-- Publish to NPM: `npm publish`
+Releases are made by admins. `master` only accepts changes through pull requests, so the version bump goes through a release PR:
+
+1. Create a branch `release/<x.y.z>` from `master` and make sure tests pass: `pnpm run test`
+2. Bump the version: `node version-bump.mjs <x.y.z>`
+3. Commit the modified files (`manifest.json`, `package.json`, `versions.json`) and open a PR
+4. After the PR is merged, tag the merge commit on `master` and push the tag: `git tag <x.y.z> && git push origin <x.y.z>`
+5. The `Create new release on new tag` workflow builds and attaches the release assets.
+
+Use a minor version bump for new settings or changed default behavior, and a patch bump for fixes.

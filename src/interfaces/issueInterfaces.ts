@@ -17,6 +17,7 @@ export interface IJiraIssue {
         issuetype: {
             iconUrl: string
             name: string
+            subtask?: boolean
         }
         priority: {
             iconUrl: string
@@ -72,6 +73,30 @@ export interface IJiraIssue {
         lastViewed: string
         worklog: {
             worklogs: IJiraWorklog[]
+        }
+        parent?: {
+            id?: string
+            key?: string
+            fields?: {
+                summary?: string
+                issuetype?: {
+                    name?: string
+                    subtask?: boolean
+                    hierarchyLevel?: number
+                }
+                parent?: {
+                    id?: string
+                    key?: string
+                    fields?: {
+                        summary?: string
+                        issuetype?: {
+                            name?: string
+                            subtask?: boolean
+                            hierarchyLevel?: number
+                        }
+                    }
+                }
+            }
         }
         [k: string]: any
     }

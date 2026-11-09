@@ -1,7 +1,9 @@
+import ms from 'ms'
 import { Platform, requestUrl, RequestUrlParam, RequestUrlResponse } from 'obsidian'
 import { AVATAR_RESOLUTION, EAuthenticationTypes, IJiraIssueAccountSettings } from '../interfaces/settingsInterfaces'
 import { ESprintState, IJiraAutocompleteField, IJiraBoard, IJiraDevStatus, IJiraField, IJiraIssue, IJiraSearchResults, IJiraSprint, IJiraStatus, IJiraUser } from '../interfaces/issueInterfaces'
-import { SettingsData } from "../settings"
+import { DEFAULT_SETTINGS, SettingsData } from "../settings"
+import { getIssueTypeIconUrl, getPriorityIconUrl } from '../rendering/jiraIcons'
 
 interface RequestOptions {
     method: string
@@ -14,6 +16,7 @@ interface RequestOptions {
 }
 
 function getMimeType(imageBuffer: ArrayBuffer): string {
+    if (!imageBuffer) return null
     const imageBufferUint8 = new Uint8Array(imageBuffer.slice(0, 4))
     const bytes: string[] = []
     imageBufferUint8.forEach((byte) => {
@@ -39,6 +42,7 @@ function getMimeType(imageBuffer: ArrayBuffer): string {
 }
 
 function bufferBase64Encode(b: ArrayBuffer) {
+    if (!b) return ''
     const a = new Uint8Array(b)
     if (Platform.isMobileApp) {
         return btoa(String.fromCharCode(...a))
@@ -64,7 +68,7 @@ function buildUrl(host: string, requestOptions: RequestOptions, use2025Api: bool
     const normalizedPath = path.startsWith('/') ? path : '/' + path
 
     const url = new URL(`${normalizedHost}${normalizedBasePath}${normalizedPath}`)
-    const queryParameters = use2025Api ? requestOptions.queryParameters2025 : requestOptions.queryParameters
+    const queryParameters = (use2025Api && requestOptions.queryParameters2025) ? requestOptions.queryParameters2025 : requestOptions.queryParameters
     if (queryParameters) {
         url.search = queryParameters.toString()
     }
@@ -85,12 +89,46 @@ function buildHeaders(account: IJiraIssueAccountSettings): Record<string, string
     return requestHeaders
 }
 
-function isJsonResponse(response: RequestUrlResponse): boolean {
-    return response.headers && response.headers['content-type'] && response.headers['content-type'].includes('json') && response.json !== undefined
+function getResponseHeader(response: RequestUrlResponse, headerName: string): string | undefined {
+    if (!response || !response.headers) {
+        return undefined
+    }
+    const normalizedHeaderName = headerName.toLowerCase()
+    const matchingHeader = Object.keys(response.headers).find(header => header.toLowerCase() === normalizedHeaderName)
+    return matchingHeader ? response.headers[matchingHeader] : undefined
+}
+
+function hasJsonBody(response: RequestUrlResponse): boolean {
+    if (!response) {
+        return false
+    }
+    try {
+        // response.json is a lazy getter that parses the body on first access and throws
+        // (e.g. SyntaxError) if it isn't valid JSON, regardless of what content-type says.
+        if (response.json !== undefined && response.json !== null) {
+            return true
+        }
+    } catch {
+        // Fall through to parsing response.text instead.
+    }
+    if (typeof response.text === 'string' && response.text.trim()) {
+        try {
+            response.json = JSON.parse(response.text)
+            return true
+        } catch {
+            return false
+        }
+    }
+    return false
 }
 
 function isTextResponse(response: RequestUrlResponse): boolean {
-    return response.headers && response.headers['content-type'] && response.headers['content-type'].includes('text') && response.text !== undefined
+    if (!response || response.text === undefined) {
+        return false
+    }
+    const contentType = getResponseHeader(response, 'content-type')
+    const normalizedContentType = contentType && contentType.toLowerCase()
+    return !normalizedContentType || normalizedContentType.includes('text') || normalizedContentType.includes('html')
 }
 
 async function sendRequest(requestOptions: RequestOptions): Promise<any> {
@@ -98,7 +136,7 @@ async function sendRequest(requestOptions: RequestOptions): Promise<any> {
     if (requestOptions.account) {
         response = await sendRequestWithAccount(requestOptions.account, requestOptions)
 
-        if (response.status === 200 && isJsonResponse(response)) {
+        if (response.status === 200 && hasJsonBody(response)) {
             return { ...response.json, account: requestOptions.account }
         }
     } else {
@@ -106,7 +144,7 @@ async function sendRequest(requestOptions: RequestOptions): Promise<any> {
             const account = SettingsData.accounts[i]
             response = await sendRequestWithAccount(account, requestOptions)
 
-            if (response.status === 200 && isJsonResponse(response)) {
+            if (response.status === 200 && hasJsonBody(response)) {
                 return { ...response.json, account: account }
             } else if (Math.floor(response.status / 100) !== 4) {
                 break
@@ -114,7 +152,7 @@ async function sendRequest(requestOptions: RequestOptions): Promise<any> {
         }
     }
 
-    if (response && response.headers && isJsonResponse(response) && response.json.errorMessages) {
+    if (hasJsonBody(response) && response.json.errorMessages) {
         throw new Error(response.json.errorMessages.join('\n'))
     } else if (response && response.status) {
         let errorMsg
@@ -130,9 +168,9 @@ async function sendRequest(requestOptions: RequestOptions): Promise<any> {
             case 410:
                 throw new Error(`Missing API: Activate the 2025 search api in the Jira Issue account settings`)
             default:
-                if (isJsonResponse(response) && response.json.message) {
+                if (hasJsonBody(response) && response.json.message) {
                     errorMsg = response.json.message
-                } else if (isTextResponse(response) && response.text.contains('<title>Log in')) {
+                } else if (isTextResponse(response) && response.text.includes('<title>Log in')) {
                     errorMsg = 'Login required'
                 } else {
                     errorMsg = `HTTP ${response.status}`
@@ -144,6 +182,40 @@ async function sendRequest(requestOptions: RequestOptions): Promise<any> {
     }
 }
 
+class RequestTimeoutError extends Error { }
+
+const MIN_REQUEST_TIMEOUT_MS = 1000
+// setTimeout fires right away for longer delays (about 24.8 days)
+const MAX_REQUEST_TIMEOUT_MS = 2 ** 31 - 1
+
+function getRequestTimeoutMs(): number {
+    const value = (SettingsData.requestTimeout || '').trim() || DEFAULT_SETTINGS.requestTimeout
+    // ms() reads a plain number as milliseconds, but "30" here means 30 seconds
+    const timeout = /^\d+(\.\d+)?$/.test(value) ? Number(value) * 1000 : ms(value)
+    if (!(timeout > 0)) {
+        return ms(DEFAULT_SETTINGS.requestTimeout)
+    }
+    return Math.min(Math.max(timeout, MIN_REQUEST_TIMEOUT_MS), MAX_REQUEST_TIMEOUT_MS)
+}
+
+// requestUrl has no timeout: a request sent on a connection that stopped working (e.g. right
+// after switching VPN) never settles, and the issue would stay on "Loading ..." forever
+function requestUrlWithTimeout(requestUrlParam: RequestUrlParam): Promise<RequestUrlResponse> {
+    const timeoutMs = getRequestTimeoutMs()
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new RequestTimeoutError(`Timeout: Jira did not answer within ${ms(timeoutMs, { long: true })}`))
+        }, timeoutMs)
+        Promise.resolve(requestUrl(requestUrlParam)).then(response => {
+            clearTimeout(timer)
+            resolve(response)
+        }, error => {
+            clearTimeout(timer)
+            reject(error)
+        })
+    })
+}
+
 async function sendRequestWithAccount(account: IJiraIssueAccountSettings, requestOptions: RequestOptions): Promise<RequestUrlResponse> {
     let response
     const requestUrlParam: RequestUrlParam = {
@@ -153,18 +225,24 @@ async function sendRequestWithAccount(account: IJiraIssueAccountSettings, reques
         contentType: 'application/json',
     }
     try {
-        response = await requestUrl(requestUrlParam)
+        response = await requestUrlWithTimeout(requestUrlParam)
         SettingsData.logRequestsResponses && console.info('JiraIssue:Fetch:', { request: requestUrlParam, response })
     } catch (errorResponse) {
         SettingsData.logRequestsResponses && console.warn('JiraIssue:Fetch:', { request: requestUrlParam, response: errorResponse })
+        if (errorResponse instanceof RequestTimeoutError) {
+            throw errorResponse
+        }
         response = errorResponse
     }
     return response
 }
 
 async function preFetchImage(account: IJiraIssueAccountSettings, url: string): Promise<string> {
+    if (!url || typeof url !== 'string') {
+        return url || ''
+    }
     // Pre fetch only images hosted on the Jira server
-    if (!url.startsWith(account.host)) {
+    if (!account || !account.host || !url.startsWith(account.host)) {
         return url
     }
 
@@ -175,7 +253,7 @@ async function preFetchImage(account: IJiraIssueAccountSettings, url: string): P
     }
     let response: RequestUrlResponse
     try {
-        response = await requestUrl(options)
+        response = await requestUrlWithTimeout(options)
         SettingsData.logImagesFetch && console.info('JiraIssue:FetchImage:', { request: options, response })
     } catch (errorResponse) {
         SettingsData.logImagesFetch && console.warn('JiraIssue:FetchImage:', { request: options, response: errorResponse })
@@ -192,27 +270,136 @@ async function preFetchImage(account: IJiraIssueAccountSettings, url: string): P
 }
 
 async function fetchIssueImages(issue: IJiraIssue) {
+    const disableImages = issue.account?.disableImageFetch
     if (issue.fields) {
         if (issue.fields.issuetype && issue.fields.issuetype.iconUrl) {
-            issue.fields.issuetype.iconUrl = await preFetchImage(issue.account, issue.fields.issuetype.iconUrl)
+            if (disableImages) {
+                issue.fields.issuetype.iconUrl = getIssueTypeIconUrl(issue.fields.issuetype.name)
+            } else {
+                issue.fields.issuetype.iconUrl = await preFetchImage(issue.account, issue.fields.issuetype.iconUrl)
+            }
         }
         if (issue.fields.reporter) {
-            issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION] = await preFetchImage(issue.account, issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION])
+            if (disableImages) {
+                if (issue.fields.reporter.avatarUrls) {
+                    issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION] = ""
+                }
+            } else if (issue.fields.reporter.avatarUrls && issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION]) {
+                issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION] = await preFetchImage(issue.account, issue.fields.reporter.avatarUrls[AVATAR_RESOLUTION])
+            }
         }
-        if (issue.fields.assignee && issue.fields.assignee.avatarUrls && issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION]) {
-            issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION] = await preFetchImage(issue.account, issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION])
+        if (issue.fields.assignee && issue.fields.assignee.avatarUrls) {
+            if (disableImages) {
+                issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION] = ""
+            } else if (issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION]) {
+                issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION] = await preFetchImage(issue.account, issue.fields.assignee.avatarUrls[AVATAR_RESOLUTION])
+            }
         }
         if (issue.fields.priority && issue.fields.priority.iconUrl) {
-            issue.fields.priority.iconUrl = await preFetchImage(issue.account, issue.fields.priority.iconUrl)
+            if (disableImages) {
+                issue.fields.priority.iconUrl = getPriorityIconUrl(issue.fields.priority.name)
+            } else {
+                issue.fields.priority.iconUrl = await preFetchImage(issue.account, issue.fields.priority.iconUrl)
+            }
         }
     }
+}
+
+// Resolves to the accounts whose custom field names are not known: loading them failed and
+// no names of an earlier load are left
+let customFieldsUpdate: Promise<Set<IJiraIssueAccountSettings>> = Promise.resolve(new Set())
+// Loads started again for those accounts, one per account at a time
+const customFieldsRetries = new Map<IJiraIssueAccountSettings, Promise<boolean>>()
+
+function hasCustomFieldNames(account: IJiraIssueAccountSettings): boolean {
+    return Object.keys(account.cache.customFieldsNameToId || {}).length > 0
+}
+
+// true when the names of this account are known afterwards, from this load or an earlier one
+async function fetchAccountCustomFields(account: IJiraIssueAccountSettings): Promise<boolean> {
+    try {
+        const response = await sendRequest(
+            {
+                method: 'GET',
+                path: `/field`,
+                account: account,
+            }
+        ) as IJiraField[]
+        account.cache.customFieldsIdToName = {}
+        account.cache.customFieldsNameToId = {}
+        account.cache.customFieldsType = {}
+        for (const i in response) {
+            const field = response[i]
+            if (field.custom && field.schema && field.schema.customId) {
+                account.cache.customFieldsIdToName[field.schema.customId] = field.name
+                account.cache.customFieldsNameToId[field.name] = field.schema.customId.toString()
+                account.cache.customFieldsType[field.schema.customId] = field.schema
+                SettingsData.cache.columns.push(field.schema.customId.toString(), field.name.toUpperCase())
+            }
+        }
+        // Virtual field mapping for deprecated Epic fields and Parent fields (only if not provided by Jira server)
+        if (!account.cache.customFieldsNameToId['EPIC NAME']) account.cache.customFieldsNameToId['EPIC NAME'] = 'VIRTUAL_EPIC_NAME'
+        if (!account.cache.customFieldsNameToId['Epic Name']) account.cache.customFieldsNameToId['Epic Name'] = 'VIRTUAL_EPIC_NAME'
+        if (!account.cache.customFieldsNameToId['EPIC LINK']) account.cache.customFieldsNameToId['EPIC LINK'] = 'VIRTUAL_EPIC_NAME'
+        if (!account.cache.customFieldsNameToId['Epic Link']) account.cache.customFieldsNameToId['Epic Link'] = 'VIRTUAL_EPIC_NAME'
+        account.cache.customFieldsIdToName['VIRTUAL_EPIC_NAME'] = 'EPIC NAME'
+
+        if (!account.cache.customFieldsNameToId['PARENT']) account.cache.customFieldsNameToId['PARENT'] = 'VIRTUAL_PARENT'
+        if (!account.cache.customFieldsNameToId['Parent']) account.cache.customFieldsNameToId['Parent'] = 'VIRTUAL_PARENT'
+        if (!account.cache.customFieldsNameToId['PARENT LINK']) account.cache.customFieldsNameToId['PARENT LINK'] = 'VIRTUAL_PARENT'
+        if (!account.cache.customFieldsNameToId['Parent Link']) account.cache.customFieldsNameToId['Parent Link'] = 'VIRTUAL_PARENT'
+        account.cache.customFieldsIdToName['VIRTUAL_PARENT'] = 'PARENT'
+        return true
+    } catch (e) {
+        console.error('Error while retrieving custom fields list of account:', account.alias, e)
+        // The name maps are only replaced after a successful load, so earlier names are still valid
+        return hasCustomFieldNames(account)
+    }
+}
+
+async function fetchCustomFields(): Promise<Set<IJiraIssueAccountSettings>> {
+    const accountsWithoutNames = new Set<IJiraIssueAccountSettings>()
+    SettingsData.cache.columns = []
+    for (const account of SettingsData.accounts) {
+        if (!await fetchAccountCustomFields(account)) {
+            accountsWithoutNames.add(account)
+        }
+    }
+    if (SettingsData.cache.columns.indexOf('EPIC NAME') === -1) {
+        SettingsData.cache.columns.push('EPIC NAME')
+    }
+    if (SettingsData.cache.columns.indexOf('EPIC LINK') === -1) {
+        SettingsData.cache.columns.push('EPIC LINK')
+    }
+    if (SettingsData.cache.columns.indexOf('PARENT') === -1) {
+        SettingsData.cache.columns.push('PARENT')
+    }
+    if (SettingsData.cache.columns.indexOf('PARENT LINK') === -1) {
+        SettingsData.cache.columns.push('PARENT LINK')
+    }
+    return accountsWithoutNames
+}
+
+function retryAccountCustomFields(account: IJiraIssueAccountSettings, accountsWithoutNames: Set<IJiraIssueAccountSettings>): Promise<boolean> {
+    let retry = customFieldsRetries.get(account)
+    if (!retry) {
+        retry = fetchAccountCustomFields(account).then(loaded => {
+            customFieldsRetries.delete(account)
+            if (loaded) {
+                accountsWithoutNames.delete(account)
+            }
+            return loaded
+        })
+        customFieldsRetries.set(account, retry)
+    }
+    return retry
 }
 
 export default {
 
     async getIssue(issueKey: string, options: { fields?: string[], account?: IJiraIssueAccountSettings } = {}): Promise<IJiraIssue> {
         const opt = {
-            fields: options.fields || [],
+            fields: (options.fields && options.fields.length > 0) ? options.fields : ['*all'],
             account: options.account || null,
         }
         const queryParameters = new URLSearchParams({
@@ -280,32 +467,19 @@ export default {
     },
 
     async updateCustomFieldsCache(): Promise<void> {
-        SettingsData.cache.columns = []
-        for (const account of SettingsData.accounts) {
-            try {
-                const response = await sendRequest(
-                    {
-                        method: 'GET',
-                        path: `/field`,
-                        account: account,
-                    }
-                ) as IJiraField[]
-                account.cache.customFieldsIdToName = {}
-                account.cache.customFieldsNameToId = {}
-                account.cache.customFieldsType = {}
-                for (const i in response) {
-                    const field = response[i]
-                    if (field.custom && field.schema && field.schema.customId) {
-                        account.cache.customFieldsIdToName[field.schema.customId] = field.name
-                        account.cache.customFieldsNameToId[field.name] = field.schema.customId.toString()
-                        account.cache.customFieldsType[field.schema.customId] = field.schema
-                        SettingsData.cache.columns.push(field.schema.customId.toString(), field.name.toUpperCase())
-                    }
-                }
-            } catch (e) {
-                console.error('Error while retrieving custom fields list of account:', account.alias, e)
-            }
+        customFieldsUpdate = fetchCustomFields()
+        await customFieldsUpdate
+    },
+
+    // Resolves once the custom field names being loaded are known, right away when none are loading.
+    // false when the names of this account could not be loaded (e.g. timeout or 403 on /field).
+    // Callers have just had an answer from Jira, so names that failed before are loaded again
+    async customFieldsLoaded(account: IJiraIssueAccountSettings): Promise<boolean> {
+        const accountsWithoutNames = await customFieldsUpdate
+        if (!account || !accountsWithoutNames.has(account)) {
+            return true
         }
+        return retryAccountCustomFields(account, accountsWithoutNames)
     },
 
     // async updateJQLAutoCompleteCache(): Promise<void> {

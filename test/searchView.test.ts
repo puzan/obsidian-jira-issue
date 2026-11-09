@@ -1,10 +1,11 @@
 jest.mock('../src/settings', () => {
-    return { SettingsData: { cache: { columns: ['CUSTOM1', '12345'] } } }
+    return { SettingsData: { cache: { columns: ['CUSTOM1', '12345', 'EPIC NAME'] } } }
 })
 jest.mock('../src/utils', () => { return { getAccountByAlias: jest.fn() } })
 
 import { COMPACT_SYMBOL, ESearchColumnsTypes, ESearchResultsRenderingTypes } from '../src/interfaces/settingsInterfaces'
 import { SearchView } from '../src/searchView'
+import { SettingsData } from '../src/settings'
 import { TestAccountOpen } from './testData'
 import * as Utils from '../src/utils'
 
@@ -30,6 +31,21 @@ describe('SearchView', () => {
                 const sv = SearchView.fromString(kQuery)
                 expect(sv.query).toEqual(kQuery)
             })
+            test('legacy query only with a colon in a modern Jira Cloud accountId', () => {
+                // https://github.com/Obsidian-jira-plugin/obsidian-jira-issue/issues/21
+                const kQueryWithAccountId = `project in (P1,P2) and sprint != 871 and assignee = 70121:a1118173-3f72-4aa0-be80-0976679a9d25`
+                const sv = SearchView.fromString(kQueryWithAccountId)
+                expect(sv.query).toEqual(kQueryWithAccountId)
+            })
+            test.each(['query', 'query:', 'label', 'label:', 'account', 'account:', 'columns', 'columns:'])(
+                'a single line that is just the bare reserved word "%s" is treated as literal query text, not an empty advanced-mode value',
+                (line) => {
+                    const sv = SearchView.fromString(line)
+                    expect(sv.query).toEqual(line)
+                    expect(sv.label).toBeNull()
+                    expect(sv.account).toBeNull()
+                    expect(sv.columns).toEqual([])
+                })
             test('Full basic query', () => {
                 const sv = SearchView.fromString(`type: ${kType}
 ${kComment}
@@ -104,6 +120,19 @@ account: ${TestAccountOpen.alias}`)
                 ])
                 expect(sv.account).toBeNull()
             })
+            test('Virtual Epic and Parent aliases', () => {
+                const sv = SearchView.fromString(`type: ${kType}
+    query: ${kQuery}
+    columns: $Epic, $Epic Link, $Epic Name, $Parent, $Parent Link, $Parent Name`)
+                expect(sv.columns).toEqual([
+                    { compact: false, extra: 'Epic', type: ESearchColumnsTypes.CUSTOM_FIELD },
+                    { compact: false, extra: 'Epic Link', type: ESearchColumnsTypes.CUSTOM_FIELD },
+                    { compact: false, extra: 'Epic Name', type: ESearchColumnsTypes.CUSTOM_FIELD },
+                    { compact: false, extra: 'Parent', type: ESearchColumnsTypes.CUSTOM_FIELD },
+                    { compact: false, extra: 'Parent Link', type: ESearchColumnsTypes.CUSTOM_FIELD },
+                    { compact: false, extra: 'Parent Name', type: ESearchColumnsTypes.CUSTOM_FIELD },
+                ])
+            })
         })
 
         describe('Negative tests', () => {
@@ -114,6 +143,10 @@ account: ${TestAccountOpen.alias}`)
         limit: ${kLimit}
         ${kInvalidKey}: ${kInvalidValue}
         columns: ${kColumns}`)).toThrow(new Error(`Invalid key: ${kInvalidKey}`))
+            })
+            test('Invalid keyword key on a single line still throws instead of becoming literal query text', () => {
+                expect(() => SearchView.fromString(`${kInvalidKey}: ${kInvalidValue}`))
+                    .toThrow(new Error(`Invalid key: ${kInvalidKey}`))
             })
             test('Invalid type', () => {
                 expect(() => SearchView.fromString(`type: ${kTypeInvalid}
@@ -198,6 +231,9 @@ account: ${TestAccountOpen.alias}
         test('getCacheKey', () => {
             expect(sv.getCacheKey()).toEqual(`${kQuery}${kLimit}${TestAccountOpen.alias}`)
         })
+        test('getSavedResultsKey', () => {
+            expect(sv.getSavedResultsKey()).toEqual(`${kQuery}${kLimit}${TestAccountOpen.alias}|TABLE:KEY,SUMMARY,${COMPACT_SYMBOL}ASSIGNEE,${COMPACT_SYMBOL}REPORTER,STATUS,NOTES`)
+        })
     })
 
 
@@ -232,6 +268,19 @@ query: ${kQuery}
 query: ${kQuery}
 `)
         })
+    })
+
+    test('getSavedResultsKey tells the views of the same query apart', () => {
+        const searchColumns = (SettingsData as any).searchColumns
+        ;(SettingsData as any).searchColumns = [{ type: ESearchColumnsTypes.KEY, compact: false, extra: '' }]
+        try {
+            expect(SearchView.fromString(`type: LIST\nquery: ${kQuery}`).getSavedResultsKey()).toEqual(`${kQuery}|LIST`)
+            expect(SearchView.fromString(`type: TABLE\nquery: ${kQuery}`).getSavedResultsKey()).toEqual(`${kQuery}|TABLE:KEY`)
+            expect(SearchView.fromString(`type: TABLE\nquery: ${kQuery}\ncolumns: KEY, ${COMPACT_SYMBOL}$CUSTOM1, NOTES.status`).getSavedResultsKey())
+                .toEqual(`${kQuery}|TABLE:KEY,${COMPACT_SYMBOL}CUSTOM_FIELD.CUSTOM1,NOTES.status`)
+        } finally {
+            (SettingsData as any).searchColumns = searchColumns
+        }
     })
 
     afterEach(() => {

@@ -1,9 +1,23 @@
+import moment from "moment"
 import { FrontMatterCache, TFile } from "obsidian"
 import { IJiraIssue } from "../interfaces/issueInterfaces"
-import { EColorSchema, IJiraIssueAccountSettings } from "../interfaces/settingsInterfaces"
+import { EColorSchema, ERenderStyle, IJiraIssueAccountSettings } from "../interfaces/settingsInterfaces"
+import LastGoodCache, { LastGoodItem } from "../lastGoodCache"
 import { ObsidianApp } from "../main"
 import { SearchView } from "../searchView"
 import { SettingsData } from "../settings"
+import { scheduleOverflowElementRefresh } from "./overflowText"
+
+export {
+    JIRA_ISSUE_ICON_SVG_BASE_URL,
+    JIRA_PRIORITY_ICON_SVG_BASE_URL,
+    generateJiraIssueTypeSvgURL,
+    generateJiraIssuePrioritySvgURL,
+    JIRA_ISSUE_TYPE_ICON_MAP,
+    JIRA_PRIORITY_ICON_MAP,
+    JIRA_DEFAULT_ISSUE_ICON,
+    JIRA_DEFAULT_PRIORITY_ICON
+} from "./jiraIcons"
 
 export const JIRA_STATUS_COLOR_MAP: Record<string, string> = {
     'blue-gray': 'is-info',
@@ -26,22 +40,31 @@ export const JIRA_STATUS_COLOR_MAP_BY_NAME: Record<string, string> = {
     'Closed': 'is-success'
 }
 
+export interface IStaleInfo {
+    updateTime: number
+    error: unknown
+}
+
+function resolveWebBaseUrl(account: IJiraIssueAccountSettings): string {
+    return (account.webBaseUrl || account.host).trim().replace(/\/+$/, '')
+}
+
 export default {
     issueUrl(account: IJiraIssueAccountSettings, issueKey: string): string {
         try {
-            return (new URL(`${account.host}/browse/${issueKey}`)).toString()
-        } catch (e) { return '' }
+            return (new URL(`${resolveWebBaseUrl(account)}/browse/${issueKey}`)).toString()
+        } catch { return '' }
     },
 
     searchUrl(account: IJiraIssueAccountSettings, searchQuery: string): string {
         try {
-            return (new URL(`${account.host}/issues/?jql=${searchQuery}`)).toString()
-        } catch (e) { return '' }
+            return (new URL(`${resolveWebBaseUrl(account)}/issues/?jql=${searchQuery}`)).toString()
+        } catch { return '' }
     },
 
     getTheme(): string {
         switch (SettingsData.colorSchema) {
-            case EColorSchema.FOLLOW_OBSIDIAN:
+            case EColorSchema.FOLLOW_OBSIDIAN: {
                 const obsidianTheme = (ObsidianApp.vault as any).getConfig("theme")
                 if (obsidianTheme === 'obsidian') {
                     return 'is-dark'
@@ -55,6 +78,7 @@ export default {
                     }
                 }
                 break
+            }
             case EColorSchema.LIGHT:
                 return 'is-light'
             case EColorSchema.DARK:
@@ -72,7 +96,8 @@ export default {
     },
 
     renderContainer(children: HTMLElement[]): HTMLElement {
-        const container = createDiv({ cls: 'jira-issue-container' })
+        const renderStyleClass = SettingsData.renderStyle === ERenderStyle.CLASSIC ? 'ji-style-classic' : 'ji-style-modern'
+        const container = createDiv({ cls: `jira-issue-container ${renderStyleClass}` })
         for (const child of children) {
             container.appendChild(child)
         }
@@ -117,13 +142,34 @@ export default {
         }
         createEl('a', { cls: `ji-tag is-link ${this.getTheme()} no-wrap`, href: this.issueUrl(issue.account, issue.key), title: this.issueUrl(issue.account, issue.key), text: issue.key, parent: tagsRow })
         if (!compact) {
-            createSpan({ cls: `ji-tag ${this.getTheme()} issue-summary`, text: issue.fields.summary, parent: tagsRow })
+            this.renderOverflowTag(tagsRow, `ji-tag ${this.getTheme()} issue-summary`, issue.fields.summary, issue.fields.summary, SettingsData.issueSummaryMaxWidthRem)
         }
         const statusColor = JIRA_STATUS_COLOR_MAP_BY_NAME[issue.fields.status.name] ||
             JIRA_STATUS_COLOR_MAP[issue.fields.status.statusCategory.colorName] ||
             'is-light'
-        createSpan({ cls: `ji-tag no-wrap ${statusColor}`, text: issue.fields.status.name, title: issue.fields.status.description, attr: { 'data-status': issue.fields.status.name }, parent: tagsRow })
+        const statusTitle = issue.fields.status.description
+            ? `${issue.fields.status.name}: ${issue.fields.status.description}`
+            : issue.fields.status.name
+        this.renderOverflowTag(tagsRow, `ji-tag no-wrap issue-status ${statusColor}`, issue.fields.status.name, statusTitle, SettingsData.issueStatusMaxWidthRem, {
+            'data-status': issue.fields.status.name,
+        })
         return tagsRow
+    },
+
+    renderOverflowTag(parent: HTMLElement, classes: string, text: string, title: string, maxWidthRem: number, attributes: Record<string, string> = {}): HTMLElement {
+        const tag = createSpan({
+            cls: `${classes} ji-overflow-tag`,
+            attr: {
+                ...attributes,
+                'aria-label': title,
+                style: `max-width: ${maxWidthRem}rem`,
+            },
+            parent,
+        })
+        const viewport = createSpan({ cls: 'ji-overflow-viewport', parent: tag })
+        createSpan({ cls: 'ji-overflow-text', text, parent: viewport })
+        scheduleOverflowElementRefresh(tag)
+        return tag
     },
 
     renderIssueError(issueKey: string, message: string): HTMLElement {
@@ -132,6 +178,72 @@ export default {
         createSpan({ cls: 'ji-tag is-danger is-light', text: issueKey, parent: tagsRow })
         createSpan({ cls: 'ji-tag is-danger', text: message, parent: tagsRow })
         return tagsRow
+    },
+
+    // Keep showing the last data fetched successfully, flagged as stale, instead of the error.
+    // Saved data that cannot be rendered falls back to the error, also when rendering is async
+    renderSavedOrError<T, R>(lastGood: LastGoodItem<T>, error: unknown, renderSaved: (data: T, stale: IStaleInfo) => R, renderError: () => R): R {
+        if (lastGood) {
+            try {
+                const rendered = renderSaved(lastGood.data, { updateTime: lastGood.updateTime, error })
+                return rendered instanceof Promise ? rendered.catch(() => renderError()) as unknown as R : rendered
+            } catch {
+                // Falls back to the error below
+            }
+        }
+        return renderError()
+    },
+
+    renderIssueFailure(issueKey: string, error: unknown, compact = false, cacheKey = issueKey): HTMLElement {
+        return this.renderSavedOrError(LastGoodCache.getIssue(cacheKey), error,
+            (issue: IJiraIssue, stale: IStaleInfo) => {
+                const tagsRow = this.renderIssue(issue, compact)
+                this.renderStaleMarker(tagsRow, 'this issue', stale)
+                return tagsRow
+            },
+            () => this.renderIssueError(issueKey, error as string))
+    },
+
+    // For an issue Jira returned: if it cannot be rendered, the error is shown, not the saved
+    // issue, since Jira did answer. onRendered (saving the issue) only runs after a render
+    renderIssueOrError(issueKey: string, issue: IJiraIssue, compact = false, onRendered: () => void = null): HTMLElement {
+        let tagsRow: HTMLElement
+        try {
+            tagsRow = this.renderIssue(issue, compact)
+        } catch (err) {
+            return this.renderIssueError(issueKey, String(err))
+        }
+        this.saveRendered(onRendered)
+        return tagsRow
+    },
+
+    // Runs after a successful render. A failed save is only logged, so content that rendered
+    // fine is not replaced by an error
+    saveRendered(save: () => void): void {
+        try {
+            save?.()
+        } catch (err) {
+            this.logSaveError(err)
+        }
+    },
+
+    logSaveError(err: unknown): void {
+        console.warn('JiraIssue: unable to save the data for offline use', err)
+    },
+
+    formatUpdateTime(updateTime: number): string {
+        return moment(updateTime).format('llll')
+    },
+
+    renderStaleMarker(parent: HTMLElement, subject: string, stale: IStaleInfo): HTMLElement {
+        const reason = stale.error instanceof Error ? stale.error.message : String(stale.error)
+        const marker = createSpan({
+            cls: 'ji-tag is-warning ji-stale-marker',
+            text: '!',
+            attr: { 'aria-label': `Could not refresh ${subject}. Showing data from ${this.formatUpdateTime(stale.updateTime)}.\n\n${reason}` },
+        })
+        parent.prepend(marker)
+        return marker
     },
 
     renderAccountColorBand(account: IJiraIssueAccountSettings, parent: HTMLDivElement) {
